@@ -1,0 +1,38 @@
+{
+  "description": "all three formats plus false-positive traps: bare headers, bad checksum, truncation, tiny stream, zeros",
+  "size": 10778,
+  "streams": [
+    {
+      "compressed_size": 1016,
+      "crc32": "1bacb66b",
+      "decompressed_size": 4000,
+      "format": "zlib",
+      "offset": 512,
+      "original_name": null
+    },
+    {
+      "compressed_size": 1005,
+      "crc32": "7135860f",
+      "decompressed_size": 4000,
+      "format": "gzip",
+      "offset": 1628,
+      "original_name": "inner.txt"
+    },
+    {
+      "compressed_size": 1472,
+      "crc32": "a24b7652",
+      "decompressed_size": 5000,
+      "format": "deflate",
+      "offset": 2733,
+      "original_name": null
+    },
+    {
+      "compressed_size": 780,
+      "crc32": "cf7d0981",
+      "decompressed_size": 3000,
+      "format": "deflate",
+      "offset": 4819,
+      "original_name": null
+    }
+  ]
+}

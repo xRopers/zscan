@@ -1,0 +1,38 @@
+{
+  "description": "gzip members with and without FNAME, one with every optional header field, multi-member",
+  "size": 5795,
+  "streams": [
+    {
+      "compressed_size": 1452,
+      "crc32": "a54c6b50",
+      "decompressed_size": 6000,
+      "format": "gzip",
+      "offset": 300,
+      "original_name": "hello.txt"
+    },
+    {
+      "compressed_size": 1217,
+      "crc32": "9bee4550",
+      "decompressed_size": 4000,
+      "format": "gzip",
+      "offset": 2986,
+      "original_name": null
+    },
+    {
+      "compressed_size": 863,
+      "crc32": "f3188021",
+      "decompressed_size": 3000,
+      "format": "gzip",
+      "offset": 4267,
+      "original_name": "all_fields.bin"
+    },
+    {
+      "compressed_size": 465,
+      "crc32": "6601438b",
+      "decompressed_size": 1500,
+      "format": "gzip",
+      "offset": 5130,
+      "original_name": null
+    }
+  ]
+}

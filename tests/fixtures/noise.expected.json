@@ -1,0 +1,5 @@
+{
+  "description": "1 MiB of random bytes; nothing should be found",
+  "size": 1048576,
+  "streams": []
+}

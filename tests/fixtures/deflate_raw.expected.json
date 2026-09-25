@@ -1,0 +1,30 @@
+{
+  "description": "raw deflate streams (fixed/dynamic and stored) between random filler",
+  "size": 10066,
+  "streams": [
+    {
+      "compressed_size": 1791,
+      "crc32": "eaaa2678",
+      "decompressed_size": 8000,
+      "format": "deflate",
+      "offset": 2048,
+      "original_name": null
+    },
+    {
+      "compressed_size": 1158,
+      "crc32": "50f7fe3e",
+      "decompressed_size": 4000,
+      "format": "deflate",
+      "offset": 6839,
+      "original_name": null
+    },
+    {
+      "compressed_size": 1005,
+      "crc32": "0d0da911",
+      "decompressed_size": 1000,
+      "format": "deflate",
+      "offset": 8061,
+      "original_name": null
+    }
+  ]
+}

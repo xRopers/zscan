@@ -1,0 +1,68 @@
+# zscan — offzip/packzip redesign
+
+## Goal
+A ground-up Rust replacement for Luigi Auriemma's offzip + packzip: find compressed streams inside arbitrary binary files, extract them, and reinject edited versions. One tool, manifest-driven, with round-trip verification. A GUI comes later, built on the same core library.
+
+## Language and key crates
+- Rust (workspace)
+- `flate2` with `zlib-ng` or `zlib` backend; `libz-sys` for full strategy/memLevel control
+- `memmap2` (large inputs), `rayon` (parallel scanning), `clap` (CLI), `serde` + `serde_json`/`toml` (manifest)
+- Later codecs: `zstd`, `lz4_flex`, `xz2`, `brotli`, `bzip2`
+
+## Layout
+```
+zscan/
+  crates/
+    zscan-core/   # library: scanning, codecs, manifest, pack logic
+    zscan-cli/    # clap CLI
+    zscan-gui/    # later: egui or Tauri, depends on zscan-core only
+  zscan-core/src/codecs/   # deflate.rs, zlib.rs, gzip.rs, zstd.rs ...
+  tests/fixtures/          # files with known streams at known offsets
+```
+The core must never depend on the CLI or GUI. The GUI calls the library directly, never shells out.
+
+## CLI
+```
+zscan scan    <file> [-o manifest.json]   # find streams, write manifest
+zscan extract <file> -m manifest.json -d out/
+zscan pack    <file> -m manifest.json [-o patched.bin] [--dry-run]
+zscan info    <file>                      # summary + entropy map
+```
+All commands support `--json` output for scripting.
+
+## Manifest (per stream)
+- id, offset, compressed_size, decompressed_size
+- format: raw deflate | zlib | gzip | (later) zstd, lz4, xz, brotli, bzip2
+- detected params: level, window bits, memLevel, strategy, `exact_match: bool`
+- checksum of original decompressed data (CRC32/Adler-32)
+- extracted filename
+- optional length-field rules: location, width, endianness, what it measures
+
+## Requirements / improvements over offzip+packzip
+1. **Codec trait** so each format is one file.
+2. **False-positive filtering:** minimum decompressed size and ratio, require a valid stream end, verify zlib header check + Adler-32 / gzip CRC, optional output entropy check.
+3. **Fast scanning:** cheap candidate prefilter (zlib headers `78 01/5E/9C/DA`, gzip magic, valid deflate block bits for raw), inflate only candidates, mmap input, parallel chunks with overlap, skip past found streams.
+4. **Parameter matching at scan time:** recompress original data across level × strategy × memLevel; if a combo reproduces the original bytes exactly, record it so unedited streams round-trip bit-identically.
+5. **Pack fitting:** reuse matched params; if the new stream is too big, try stronger settings, then use slack or relocate if length-field rules allow, else fail with a clear "N bytes over" message. Pad remaining space with zeros.
+6. **Safety:** never modify input in place by default, `--dry-run` shows per-stream size deltas, post-pack verify re-scans and confirms every stream decompresses to the intended data.
+7. **Later / advanced:** preflate/precomp-style reconstruction data for bit-exact recreation of streams from unknown compressors.
+
+## Build order
+1. Workspace skeleton, Codec trait, deflate/zlib/gzip scan + manifest + extract (replaces offzip). Fixture tests.
+2. Pack with parameter matching, fitting, verify (replaces packzip).
+3. Performance: prefilter, mmap, rayon, benchmarks on multi-GB files.
+4. Extra codecs.
+5. Length-field rules, then preflate-style exact reconstruction.
+6. GUI (egui for speed of building, or Tauri for a richer hex/preview UI): entropy map, stream table (offset, format, sizes, ratio, detected type, exact-match flag), preview pane (hex/text/image), mark edited streams, pack view with dry-run + verify, save/load manifest as a project.
+
+## Status
+- Stage 1 done: `zscan scan | extract | info`. `pack` arrives with stage 2.
+- Inflate uses `miniz_oxide`'s core API directly: O(1) reset per candidate offset, one reused buffer (`DecodeCtx`). `flate2`/`libz-sys` come in at stage 2 for exact-param recompression.
+- Scan runs two passes: gzip/zlib first, then raw deflate only in the gaps. A raw match that a later match starting inside it runs past is dropped as misaligned.
+- Raw deflate defaults (from 256 MiB of random data, 0 FPs): min 256 *compressed* bytes, output entropy ≤ 7.5. Speed is about 3 MB/s single-threaded because fixed-Huffman garbage decoding dominates. That's the stage 3 target.
+- Fixtures: `crates/zscan-fixtures` builds them deterministically; `cargo run -p zscan-fixtures --bin gen-fixtures` writes `tests/fixtures/*.bin` + `*.expected.json`.
+- cargo is at `%USERPROFILE%\.cargo\bin` and is not on the Git Bash PATH; use PowerShell. `cargo test --workspace`.
+
+## Working notes
+- Prefer direct, plain explanations with concrete next steps.
+- Write tests alongside each stage; fixtures should cover each format, false-positive traps, and a pack round-trip.

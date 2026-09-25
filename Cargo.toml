@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/zscan-core", "crates/zscan-cli", "crates/zscan-fixtures"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+zscan-core = { path = "crates/zscan-core" }
+zscan-fixtures = { path = "crates/zscan-fixtures" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1.4"
+flate2 = "1"
+memmap2 = "0.9"
+miniz_oxide = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+
+# The raw-deflate pass inflates at almost every offset; keep the inflater fast in debug/test builds.
+[profile.dev.package.miniz_oxide]
+opt-level = 3

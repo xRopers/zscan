@@ -1,0 +1,27 @@
+[package]
+name = "zscan-gui"
+description = "Desktop front end for zscan-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "zscan-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.36"
+egui_extras = "0.36"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"] }
+rayon.workspace = true
+rfd = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+zscan-core.workspace = true
+
+[dev-dependencies]
+egui_kittest = "0.36"
+tempfile.workspace = true
+zscan-fixtures.workspace = true

@@ -9,6 +9,7 @@
 //! The one exception is an unverified (raw deflate) match: offsets inside it are still tried
 //! in case it is a misaligned false positive that overlaps the start of a real stream.
 
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::checksum::crc32;
 use crate::codec::{Codec, DecodeCtx, DecodeError, Format, codec_for};
 use crate::entropy::shannon;
+use crate::error::{Error, Result};
 use crate::params::EncoderParams;
 
 pub const DEFAULT_MIN_SIZE: u64 = 32;
@@ -132,7 +134,66 @@ impl ScanStats {
 
 /// [`scan`], also reporting how long each phase took.
 pub fn scan_with_stats(data: &[u8], opts: &ScanOptions) -> (Vec<FoundStream>, ScanStats) {
-    scan_chunked(data, opts, chunk_size(data.len()))
+    scan_chunked(data, opts, chunk_size(data.len()), &Progress::default())
+}
+
+/// [`scan_with_stats`], reporting progress to (and cancellable from) another thread.
+/// Returns [`Error::Cancelled`] if [`Progress::cancel`] was called.
+pub fn scan_with_progress(data: &[u8], opts: &ScanOptions, progress: &Progress) -> Result<(Vec<FoundStream>, ScanStats)> {
+    let result = scan_chunked(data, opts, chunk_size(data.len()), progress);
+    if progress.is_cancelled() { Err(Error::Cancelled) } else { Ok(result) }
+}
+
+/// Scan phases, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPhase {
+    /// Self-verifying formats; counts bytes.
+    Verified,
+    /// Raw deflate in the gaps; counts bytes.
+    Unverified,
+    /// Searching for exact encoder settings; counts streams.
+    Params,
+}
+
+/// Shared progress of a running scan, and a way to stop it early. Readers may see a
+/// phase change and its counters a moment apart; it is for display only.
+#[derive(Debug, Default)]
+pub struct Progress {
+    phase: AtomicU8,
+    done: AtomicU64,
+    total: AtomicU64,
+    cancelled: AtomicBool,
+}
+
+impl Progress {
+    /// Ask the scan to stop. It finishes the chunks and streams in progress first.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Current phase, and units done out of the phase's total.
+    pub fn get(&self) -> (ScanPhase, u64, u64) {
+        let phase = match self.phase.load(Ordering::Relaxed) {
+            0 => ScanPhase::Verified,
+            1 => ScanPhase::Unverified,
+            _ => ScanPhase::Params,
+        };
+        (phase, self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed))
+    }
+
+    fn start(&self, phase: ScanPhase, total: u64) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+        self.phase.store(phase as u8, Ordering::Relaxed);
+    }
+
+    fn advance(&self, n: u64) {
+        self.done.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 /// Work unit size: enough chunks to keep every thread busy, but not so many that
@@ -147,7 +208,7 @@ fn chunk_size(len: usize) -> usize {
 /// skipping anything. A sequential merge then replays the skip-past and lookahead rules
 /// over the sorted hits. `try_at` depends only on the offset and the window end, so this
 /// gives exactly the sequential result however the input is split.
-fn scan_chunked(data: &[u8], opts: &ScanOptions, chunk: usize) -> (Vec<FoundStream>, ScanStats) {
+fn scan_chunked(data: &[u8], opts: &ScanOptions, chunk: usize, progress: &Progress) -> (Vec<FoundStream>, ScanStats) {
     let mut stats = ScanStats { bytes: data.len() as u64, ..Default::default() };
     let max_output = usize::try_from(opts.max_output).unwrap_or(usize::MAX);
 
@@ -160,7 +221,8 @@ fn scan_chunked(data: &[u8], opts: &ScanOptions, chunk: usize) -> (Vec<FoundStre
     let t = Instant::now();
     let mut found = Vec::new();
     if !verified.is_empty() {
-        let hits = collect_hits(data, &[(0, data.len())], chunk, &verified, opts, max_output);
+        progress.start(ScanPhase::Verified, data.len() as u64);
+        let hits = collect_hits(data, &[(0, data.len())], chunk, &verified, opts, max_output, progress);
         found = resolve_verified(hits);
     }
     stats.verified_pass = t.elapsed();
@@ -174,7 +236,8 @@ fn scan_chunked(data: &[u8], opts: &ScanOptions, chunk: usize) -> (Vec<FoundStre
             pos = s.end() as usize;
         }
         gaps.push((pos, data.len()));
-        let hits = collect_hits(data, &gaps, chunk, &unverified, opts, max_output);
+        progress.start(ScanPhase::Unverified, gaps.iter().map(|(a, b)| (b - a) as u64).sum());
+        let hits = collect_hits(data, &gaps, chunk, &unverified, opts, max_output, progress);
         found.extend(resolve_unverified(hits));
         found.sort_by_key(|s| s.offset);
     }
@@ -182,7 +245,16 @@ fn scan_chunked(data: &[u8], opts: &ScanOptions, chunk: usize) -> (Vec<FoundStre
 
     let t = Instant::now();
     if opts.match_params {
-        found.par_iter_mut().for_each_init(|| DecodeCtx::new(max_output), |ctx, s| match_params(data, s, ctx));
+        progress.start(ScanPhase::Params, found.len() as u64);
+        found.par_iter_mut().for_each_init(
+            || DecodeCtx::new(max_output),
+            |ctx, s| {
+                if !progress.is_cancelled() {
+                    match_params(data, s, ctx);
+                    progress.advance(1);
+                }
+            },
+        );
     }
     stats.param_matching = t.elapsed();
     (found, stats)
@@ -196,6 +268,7 @@ fn collect_hits(
     codecs: &[&dyn Codec],
     opts: &ScanOptions,
     max_output: usize,
+    progress: &Progress,
 ) -> Vec<FoundStream> {
     // (first offset, last offset + 1, window end)
     let mut work = Vec::new();
@@ -212,7 +285,12 @@ fn collect_hits(
         .map_init(
             || DecodeCtx::new(max_output),
             |ctx, &(from, to, window_end)| {
-                (from..to).filter_map(|pos| try_at(data, pos, window_end, codecs, opts, ctx)).collect()
+                if progress.is_cancelled() {
+                    return Vec::new();
+                }
+                let hits = (from..to).filter_map(|pos| try_at(data, pos, window_end, codecs, opts, ctx)).collect();
+                progress.advance((to - from) as u64);
+                hits
             },
         )
         .collect();
@@ -496,13 +574,26 @@ mod tests {
     }
 
     #[test]
+    fn progress_and_cancel() {
+        let data = stress_blob();
+        let opts = ScanOptions::default();
+        let progress = Progress::default();
+        let (found, _) = scan_with_progress(&data, &opts, &progress).unwrap();
+        assert_eq!(progress.get(), (ScanPhase::Params, found.len() as u64, found.len() as u64), "finished every phase");
+
+        let cancelled = Progress::default();
+        cancelled.cancel();
+        assert!(matches!(scan_with_progress(&data, &opts, &cancelled), Err(Error::Cancelled)));
+    }
+
+    #[test]
     fn parallel_matches_sequential_for_any_chunking() {
         let data = stress_blob();
         let opts = ScanOptions::default();
         let expected = scan_sequential(&data, &opts);
         assert!(expected.len() > 30, "blob should contain many streams, got {}", expected.len());
         for chunk in [1, 7, 4096, 65_536, 1 << 20] {
-            assert_eq!(scan_chunked(&data, &opts, chunk).0, expected, "chunk size {chunk}");
+            assert_eq!(scan_chunked(&data, &opts, chunk, &Progress::default()).0, expected, "chunk size {chunk}");
         }
     }
 
@@ -522,7 +613,7 @@ mod tests {
         let expected = scan_sequential(&data, &opts);
         assert!(expected.len() > 200, "expected many raw false positives, got {}", expected.len());
         for chunk in [1, 13, 4096] {
-            assert_eq!(scan_chunked(&data, &opts, chunk).0, expected, "chunk size {chunk}");
+            assert_eq!(scan_chunked(&data, &opts, chunk, &Progress::default()).0, expected, "chunk size {chunk}");
         }
     }
 }

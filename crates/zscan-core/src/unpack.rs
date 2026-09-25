@@ -29,6 +29,7 @@ use crate::error::{Error, Result, io_err};
 use crate::extract::decode_stream;
 use crate::input;
 use crate::manifest::{Manifest, SourceInfo, StreamEntry, hex_u32, is_safe_filename};
+use crate::output::write_via_temp;
 use crate::params::EncoderParams;
 
 pub const UNPACK_VERSION: u32 = 1;
@@ -277,6 +278,15 @@ pub struct RebuildSummary {
 /// Recreate the original file from an unpack directory, writing it to `out`. Fails if
 /// any contents file was changed, or if the result's size or CRC-32 differs from the
 /// original's (in which case `out` has received bad data; write to a temporary file).
+/// [`rebuild`] into the file `path`, which appears only once its size and CRC-32 have
+/// been checked.
+pub fn rebuild_file(dir: &Path, path: &Path) -> Result<RebuildSummary> {
+    write_via_temp(path, |tmp| {
+        let file = File::create(tmp).map_err(io_err(tmp))?;
+        rebuild(dir, BufWriter::with_capacity(8 << 20, file))
+    })
+}
+
 pub fn rebuild(dir: &Path, out: impl Write) -> Result<RebuildSummary> {
     let index = load_index(dir)?;
     check_layout(index.streams.iter().map(|s| (s.id, s.offset, s.end(), s.file.as_str())), index.source.size)?;

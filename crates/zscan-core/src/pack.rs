@@ -32,6 +32,7 @@ use crate::error::{Error, Result, io_err};
 use crate::extract::decode_stream;
 use crate::fields::{check_fields, measure, measure_name};
 use crate::manifest::{Manifest, Measures, StreamEntry, is_safe_filename};
+use crate::output::write_via_temp;
 use crate::params::EncoderParams;
 
 #[derive(Debug, Clone)]
@@ -187,6 +188,19 @@ impl PackResult {
         }
         copy(&mut w, pos, self.output_len)?;
         w.flush()
+    }
+
+    /// Write the packed file to `path`, read it back and [verify](Self::verify_output)
+    /// it, and only then move it into place. Returns the manifest for the output, with
+    /// `source.path` set to `path`.
+    pub fn write_file(&self, input: &[u8], path: &Path) -> Result<Manifest> {
+        let mut manifest = write_via_temp(path, |tmp| {
+            let file = fs::File::create(tmp).map_err(io_err(tmp))?;
+            self.write_to(input, io::BufWriter::with_capacity(8 << 20, file)).map_err(io_err(tmp))?;
+            self.verify_output(&crate::input::open(tmp)?)
+        })?;
+        manifest.source.path = path.display().to_string();
+        Ok(manifest)
     }
 
     /// The packed file in memory, or `None` if a stream didn't fit.

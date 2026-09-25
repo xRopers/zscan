@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/zscan-core", "crates/zscan-cli", "crates/zscan-fixtures"]
+members = ["crates/zscan-core", "crates/zscan-cli", "crates/zscan-fixtures", "crates/zscan-gui"]
 
 [workspace.package]
 version = "0.1.0"

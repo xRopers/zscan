@@ -27,6 +27,9 @@ pub enum Error {
     #[error("cannot pack: {0}")]
     Pack(String),
 
+    #[error("cancelled")]
+    Cancelled,
+
     #[error("manifest names an unsafe output file {0:?} (must be a plain file name)")]
     BadFilename(String),
 }

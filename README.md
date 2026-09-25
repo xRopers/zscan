@@ -11,6 +11,21 @@ zscan is a ground-up Rust replacement for Luigi Auriemma's offzip and packzip: o
 
 ![zscan's desktop app with five zlib streams found in a game data file, one opened as text](docs/images/zscan-gui-text.png)
 
+## Why zscan over offzip and packzip
+
+offzip finds zlib/deflate streams and dumps them to files; packzip compresses a file and writes it back at an offset you give it. zscan does the whole round trip as one tool, and checks each step:
+
+- **One workflow, driven by a manifest.** A scan records every stream (offset, sizes, format, checksum, encoder settings) in a JSON manifest, and extract and pack work from that. There are no offsets to copy by hand.
+- **More formats.** gzip, zlib, raw deflate, zstd, xz, bzip2, lz4 and brotli, plus optional LZO and Oodle.
+- **Fewer false positives.** Headers and checksums are verified wherever the format has them (zlib Adler-32, gzip CRC-32, bzip2 and xz CRCs, zstd and lz4 checksums when present), and raw deflate, which has no checksum, must also pass minimum size, compression ratio and entropy filters.
+- **Unedited streams come back bit for bit.** The scan searches for the exact encoder settings (level, window, memory level and strategy for zlib; the equivalents for other formats) that reproduce each stream. Pack copies unedited streams byte for byte, and re-encodes edited ones with the settings that made the original.
+- **Edits that grow are handled.** If a new stream is too big for its slot, pack tries stronger settings, can use zero padding after the stream, or can move it to the end of the file. Otherwise it stops with an "N bytes over" message.
+- **Size and offset fields are kept up to date.** `zscan fields` finds the fields that record a stream's size or offset (size prefixes, archive directories), and pack rewrites them when a stream changes.
+- **Safe by default.** The input is never modified. `--dry-run` shows what would change, and every stream in the output is decoded again before the file is written.
+- **Bit-exact unpack and rebuild.** `zscan unpack` expands a whole file into its decompressed contents plus what's needed to rebuild it exactly, including deflate streams from compressors zscan doesn't know, via preflate reconstruction data. This is useful for storing or diffing files.
+- **Fast on big files.** It memory-maps the input and scans in parallel: about 400 MiB/s on a 4 GiB file on a 24-thread desktop CPU.
+- **Scriptable and visual.** Every command has `--json` output, and there's a desktop app with an entropy map, stream table, and hex, text and image previews.
+
 ## Download
 
 Windows x64 builds are on the [Releases](https://github.com/xRopers/zscan/releases) page. The zip holds `zscan.exe` (command line) and `zscan-gui.exe` (desktop app). The release builds include LZO and Oodle support.

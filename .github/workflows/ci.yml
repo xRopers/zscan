@@ -1,0 +1,66 @@
+# Build, test and lint every combination of the optional codec features.
+#
+# Runs on Windows, where zscan is developed (the GUI's file dialogs need GTK on Linux).
+# No Oodle library is available here, so the Oodle tests that decode and encode skip;
+# run them locally with ZSCAN_OODLE_DLL set.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.features || 'no features' }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "lzo", "oodle", "lzo,oodle"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: Build
+        run: cargo build --workspace --all-targets --features "${{ matrix.features }}"
+      - name: Test
+        run: cargo test --workspace --features "${{ matrix.features }}"
+
+  clippy:
+    name: clippy (${{ matrix.features || 'no features' }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "lzo,oodle"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.features }}
+      - run: cargo clippy --workspace --all-targets --features "${{ matrix.features }}"
+
+  msrv:
+    name: MSRV (1.89, all features)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --workspace --all-targets --features lzo,oodle

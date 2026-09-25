@@ -96,4 +96,11 @@ Open a file and scan it, then click a stream to preview it as hex, text or an im
 
 ## License
 
-The code in this repository doesn't declare a license yet. Builds made with the `lzo` feature, including the release binaries, contain the GPL-2.0 `lzo1x` crate, so they are distributed under GPL-2.0.
+zscan is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 2 of the License, or (at your option) any later version (GPL-2.0-or-later). The license text is in [LICENSE](LICENSE).
+
+Some dependencies are under other licenses, which is why this is "or later":
+
+- `preflate-rs` (bit-exact deflate reconstruction) and the GUI's window and OpenGL crates are Apache-2.0, and `cabac` (used by preflate-rs) is LGPL-3.0-or-later. A program that includes them can be distributed under GPL version 3, but not version 2 alone.
+- The optional `lzo` feature uses the `lzo1x` crate, which declares GPL-2.0 without "or later". Check its terms before distributing binaries built with `lzo`.
+
+Oodle is not part of zscan and is not covered by this license: zscan only loads the Oodle library you supply.

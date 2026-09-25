@@ -18,6 +18,7 @@ use zscan_core::{
 use crate::jobs::{Jobs, finish};
 use crate::preview::{self, Previewer};
 use crate::project::{self, Project};
+use crate::settings::Settings;
 use crate::session::{self, Level, Session, check_not_input, default_packed_path, read_edits};
 use crate::widgets::{self, entropy_strip, format_color, hex_view, human_size, text_view};
 
@@ -83,6 +84,7 @@ pub struct App {
     pub show_scan: bool,
     pub show_try: bool,
     pub show_pack: bool,
+    pub show_plugins: bool,
     show_log: bool,
     try_at: TryAt,
     pack_ui: PackUi,
@@ -90,6 +92,13 @@ pub struct App {
     allow_close: bool,
     title: String,
     last_extract_dir: Option<PathBuf>,
+    settings: Settings,
+    /// Where settings are saved; `None` (as in tests) keeps them for this run only.
+    settings_path: Option<PathBuf>,
+    /// The Oodle library path being edited in the Plugins window.
+    pub oodle_dll_text: String,
+    /// Whether Oodle is usable, checked when its library changes rather than every frame.
+    oodle_status: Result<(), String>,
 }
 
 impl App {
@@ -108,6 +117,7 @@ impl App {
             show_scan: false,
             show_try: false,
             show_pack: false,
+            show_plugins: false,
             show_log: false,
             try_at: TryAt { offset: String::new(), format: Format::Brotli, size: String::new(), match_params: true },
             pack_ui: PackUi { use_slack: false, relocate: false, align: 1, save_manifest: false },
@@ -115,6 +125,47 @@ impl App {
             allow_close: false,
             title: String::new(),
             last_extract_dir: None,
+            settings: Settings::default(),
+            settings_path: None,
+            oodle_dll_text: String::new(),
+            oodle_status: Format::Oodle.available().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Use the settings saved at `path` (and save changes there). An `oodle_dll` given
+    /// here, from the command line, wins over the saved one for this run.
+    pub fn load_settings(&mut self, path: Option<PathBuf>, oodle_dll: Option<PathBuf>) {
+        self.settings = path.as_deref().map(Settings::load).unwrap_or_default();
+        self.settings_path = path;
+        let dll = oodle_dll.or_else(|| self.settings.oodle_dll.clone());
+        self.oodle_dll_text = dll.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        zscan_core::set_oodle_dll(dll);
+        self.check_oodle();
+    }
+
+    fn check_oodle(&mut self) {
+        self.oodle_status = Format::Oodle.available().map_err(|e| e.to_string());
+    }
+
+    /// Use the Oodle library typed in the Plugins window (empty: `ZSCAN_OODLE_DLL`), and
+    /// remember it.
+    pub fn apply_oodle_dll(&mut self) {
+        let text = self.oodle_dll_text.trim();
+        let dll = (!text.is_empty()).then(|| PathBuf::from(text));
+        zscan_core::set_oodle_dll(dll.clone());
+        self.check_oodle();
+        match &self.oodle_status {
+            Ok(()) => self.session.info(match &dll {
+                Some(p) => format!("Oodle: using {}", p.display()),
+                None => "Oodle: using ZSCAN_OODLE_DLL".to_string(),
+            }),
+            Err(e) => self.session.error(format!("Oodle: {e}")),
+        }
+        self.settings.oodle_dll = dll;
+        if let Some(path) = &self.settings_path
+            && let Err(e) = self.settings.save(path)
+        {
+            self.session.error(format!("Saving settings: {e:#}"));
         }
     }
 
@@ -438,6 +489,7 @@ impl App {
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
 
         self.scan_window();
+        self.plugins_window();
         self.try_window();
         self.pack_window();
         self.log_window();
@@ -620,6 +672,11 @@ impl App {
                 self.rebuild_from_folder();
             }
             ui.separator();
+            if ui.button("Plugins…").on_hover_text("LZO and Oodle support, and where your Oodle library is").clicked() {
+                ui.close();
+                self.check_oodle();
+                self.show_plugins = true;
+            }
             if ui.button("Log").clicked() {
                 ui.close();
                 self.show_log = true;
@@ -1093,18 +1150,34 @@ impl App {
     fn scan_window(&mut self) {
         let mut open = self.show_scan;
         let mut start = false;
+        let optional = [
+            (Format::Lzo, Format::Lzo.available().map_err(|e| e.to_string()), "Only where a field in the 16 bytes before the stream holds its compressed size"),
+            (Format::Oodle, self.oodle_status.clone(), "Only where a field in the 16 bytes before the stream holds its decompressed size"),
+        ];
         egui::Window::new("Scan options").open(&mut open).resizable(false).show(&self.ctx.clone(), |ui| {
             let o = &mut self.session.scan_options;
+            let mut toggle = |ui: &mut Ui, f: Format, enabled: bool, hover: &str| {
+                let mut on = o.formats.contains(&f);
+                if ui.add_enabled(enabled, egui::Checkbox::new(&mut on, f.name())).on_hover_text(hover).on_disabled_hover_text(hover).changed() {
+                    if on {
+                        o.formats.push(f);
+                    } else {
+                        o.formats.retain(|&x| x != f);
+                    }
+                }
+            };
             ui.label("Formats");
             ui.horizontal_wrapped(|ui| {
                 for f in Format::SCANNABLE {
-                    let mut on = o.formats.contains(&f);
-                    if ui.checkbox(&mut on, f.name()).changed() {
-                        if on {
-                            o.formats.push(f);
-                        } else {
-                            o.formats.retain(|&x| x != f);
-                        }
+                    toggle(ui, f, true, "");
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Opt-in:");
+                for (f, status, how) in &optional {
+                    match status {
+                        Ok(()) => toggle(ui, *f, true, how),
+                        Err(e) => toggle(ui, *f, false, &format!("{e}. See Tools > Plugins.")),
                     }
                 }
             });
@@ -1241,6 +1314,54 @@ impl App {
         self.show_pack = open;
         if let Some(output) = run {
             self.start_pack(output);
+        }
+    }
+
+    fn plugins_window(&mut self) {
+        let mut open = self.show_plugins;
+        let mut apply = false;
+        egui::Window::new("Plugins").open(&mut open).resizable(false).show(&self.ctx.clone(), |ui| {
+            ui.set_max_width(520.0);
+            ui.heading("LZO");
+            match Format::Lzo.available() {
+                Ok(()) => ui.label("Built in (raw LZO1X)."),
+                Err(e) => ui.colored_label(ui.visuals().warn_fg_color, e.to_string()),
+            };
+            ui.separator();
+            ui.heading("Oodle");
+            if !cfg!(feature = "oodle") {
+                ui.colored_label(ui.visuals().warn_fg_color, "Not in this build (rebuild with `--features oodle`).");
+                return;
+            }
+            ui.label("zscan doesn't include Oodle. Use the oo2core library that came with the game or SDK the file is from.");
+            ui.horizontal(|ui| {
+                ui.label("Library");
+                ui.add(egui::TextEdit::singleline(&mut self.oodle_dll_text).desired_width(320.0).hint_text("oo2core_9_win64.dll; empty uses ZSCAN_OODLE_DLL"));
+                if ui.button("Browse…").clicked() {
+                    let dialog = rfd::FileDialog::new().set_title("Your Oodle library").add_filter("Oodle library", &["dll", "so", "dylib"]);
+                    if let Some(path) = dialog.pick_file() {
+                        self.oodle_dll_text = path.display().to_string();
+                        apply = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+                if ui.button("Clear").on_hover_text("Go back to ZSCAN_OODLE_DLL, if set").clicked() {
+                    self.oodle_dll_text.clear();
+                    apply = true;
+                }
+            });
+            match &self.oodle_status {
+                Ok(()) => ui.colored_label(Color32::from_rgb(90, 170, 90), "Oodle is ready."),
+                Err(e) => ui.colored_label(ui.visuals().error_fg_color, e),
+            };
+        });
+        self.show_plugins = open;
+        if apply {
+            self.apply_oodle_dll();
         }
     }
 

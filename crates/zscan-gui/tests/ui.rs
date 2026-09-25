@@ -6,7 +6,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use zscan_gui::App;
 use zscan_gui::app::{Action, Tab};
 
@@ -123,4 +123,42 @@ fn unsaved_work_asks_before_closing() {
     h.run_steps(2);
     assert!(h.state().session.file.is_none());
     h.get_by_label("Open a file…");
+}
+
+#[test]
+fn plugins_window_sets_the_oodle_library() {
+    let mut h = harness();
+    h.state_mut().show_plugins = true;
+    h.run_steps(2);
+    h.get_by_label("LZO");
+    if cfg!(feature = "lzo") {
+        h.get_by_label("Built in (raw LZO1X).");
+    } else {
+        h.get_by_label_contains("--features lzo");
+    }
+    if !cfg!(feature = "oodle") {
+        h.get_by_label_contains("--features oodle");
+        return;
+    }
+    // A library that doesn't exist: the window says so, and so does the log.
+    h.state_mut().oodle_dll_text = "no/such/oo2core_9_win64.dll".into();
+    h.run_steps(1);
+    h.get_by_label("Apply").click();
+    h.run_steps(2);
+    assert!(h.query_all_by_label_contains("not found").next().is_some(), "status shows the error");
+    assert!(h.state().session.log.last().unwrap().text.contains("not found"));
+    // Scanning for Oodle can't be switched on until the library loads.
+    h.state_mut().show_scan = true;
+    h.run_steps(2);
+    assert!(h.get_by_label("oodle").accesskit_node().is_disabled());
+
+    // With a real library (ZSCAN_OODLE_DLL), it loads and Oodle scanning can be switched on.
+    if let Some(dll) = std::env::var_os("ZSCAN_OODLE_DLL") {
+        h.state_mut().oodle_dll_text = dll.to_string_lossy().into_owned();
+        h.get_by_label("Apply").click();
+        h.run_steps(2);
+        h.get_by_label("Oodle is ready.");
+        assert!(!h.get_by_label("oodle").accesskit_node().is_disabled());
+    }
+    zscan_core::set_oodle_dll(None);
 }

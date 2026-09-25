@@ -3,6 +3,7 @@ name = "zscan-fixtures"
 description = "Deterministic test fixtures: binary blobs with compressed streams at known offsets"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish = false
 

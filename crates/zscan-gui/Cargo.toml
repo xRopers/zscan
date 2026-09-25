@@ -3,6 +3,7 @@ name = "zscan-gui"
 description = "Desktop front end for zscan-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 # egui 0.36 needs 1.95; the core library and CLI build on the workspace MSRV.
 rust-version = "1.95"
 

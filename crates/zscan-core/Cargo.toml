@@ -3,6 +3,7 @@ name = "zscan-core"
 description = "Find, extract and reinject compressed streams inside binary files"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [features]

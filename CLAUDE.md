@@ -8,6 +8,7 @@ A ground-up Rust replacement for Luigi Auriemma's offzip + packzip: find compres
 - `flate2` with `zlib-ng` or `zlib` backend; `libz-sys` for full strategy/memLevel control
 - `memmap2` (large inputs), `rayon` (parallel scanning), `clap` (CLI), `serde` + `serde_json`/`toml` (manifest)
 - Later codecs: `zstd`, `lz4_flex`, `xz2`, `brotli`, `bzip2`
+- Optional game-format plugins (feature-gated, off by default): LZO (e.g. `minilzo-rs` or bindings to liblzo2), Oodle (Kraken/Mermaid/Selkie/Leviathan). Oodle is proprietary: load the user's own `oo2core_*` DLL at runtime via `libloading`; never bundle or redistribute it
 
 ## Layout
 ```
@@ -51,7 +52,7 @@ All commands support `--json` output for scripting.
 1. Workspace skeleton, Codec trait, deflate/zlib/gzip scan + manifest + extract (replaces offzip). Fixture tests.
 2. Pack with parameter matching, fitting, verify (replaces packzip).
 3. Performance: prefilter, mmap, rayon, benchmarks on multi-GB files.
-4. Extra codecs.
+4. Extra codecs, then optional LZO and Oodle plugins behind cargo features. Oodle scanning is harder (no reliable magic, raw streams usually need the decompressed size from the container), so lean on length-field rules or user-supplied sizes.
 5. Length-field rules, then preflate-style exact reconstruction.
 6. GUI (egui for speed of building, or Tauri for a richer hex/preview UI): entropy map, stream table (offset, format, sizes, ratio, detected type, exact-match flag), preview pane (hex/text/image), mark edited streams, pack view with dry-run + verify, save/load manifest as a project.
 

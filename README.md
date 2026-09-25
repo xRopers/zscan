@@ -9,6 +9,8 @@ zscan is a ground-up Rust replacement for Luigi Auriemma's offzip and packzip: o
 - **Unpack** a whole file into its decompressed contents and **rebuild** it bit for bit.
 - A **desktop GUI** does the same with an entropy map, stream table and previews.
 
+![zscan's desktop app with five zlib streams found in a game data file, one opened as text](docs/images/zscan-gui-text.png)
+
 ## Download
 
 Windows x64 builds are on the [Releases](https://github.com/xRopers/zscan/releases) page. The zip holds `zscan.exe` (command line) and `zscan-gui.exe` (desktop app). The release builds include LZO and Oodle support.
@@ -93,6 +95,12 @@ zscan-gui [--oodle-dll PATH] [FILE | project.zscan]
 ```
 
 Open a file and scan it, then click a stream to preview it as hex, text or an image. Replace, export or revert streams, and use the Pack window for a dry run, then write and verify. Your work can be saved as a `.zscan` project.
+
+The strip along the top is the file's entropy (orange is high), with the streams it found drawn below it.
+
+![A zlib stream containing a PNG, previewed as an image](docs/images/zscan-gui-image.png)
+
+![The Pack window's dry run: the edited text stream is recompressed with its original settings and fits its slot](docs/images/zscan-gui-pack.png)
 
 ## License
 

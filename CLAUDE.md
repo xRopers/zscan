@@ -56,7 +56,7 @@ All commands support `--json` output for scripting.
 6. GUI (egui for speed of building, or Tauri for a richer hex/preview UI): entropy map, stream table (offset, format, sizes, ratio, detected type, exact-match flag), preview pane (hex/text/image), mark edited streams, pack view with dry-run + verify, save/load manifest as a project.
 
 ## Status
-- Stages 1–4 done: `zscan scan | extract | pack | try | fields | info`. Formats: gzip, zlib, raw deflate, zstd, xz, bzip2, lz4 frame, and brotli (not scannable; add with `zscan try`).
+- Stages 1–4 done: `zscan scan | extract | pack | try | fields | unpack | rebuild | info`. Formats: gzip, zlib, raw deflate, zstd, xz, bzip2, lz4 frame, and brotli (not scannable; add with `zscan try`).
 - Codec trait (stage 4): each format file owns probe/decode plus `find_params` (exact match), `default_params` (derived from the original header), `adapt_params`, `stronger_params` and `encode`. Params are the tagged `EncoderParams` enum (`params.rs`). Manifest v2 stores `exact_params`, and v1 manifests are migrated on load.
 - Exact matching per format:
   - zstd: level search with header flags. Frames without a content size need the streaming (`e_continue` then `e_end`) path.
@@ -70,7 +70,13 @@ All commands support `--json` output for scripting.
   - `zscan fields --apply` detects candidates: integers just before a stream (any value), or anywhere for values ≥ `--min-value`. It keeps only locations claimed once; a quantity may legitimately have several fields.
   - `--relocate` moves a stream that doesn't fit to the end of the file. It requires offset + compressed-size fields and no field in the 16 bytes in front (a local header would be left behind).
   - The tests read packed archives with an independent reader (`zscan_fixtures::read_archive`).
-- Stage 5B (preflate): `preflate-rs` 0.7.6 (Microsoft, Apache-2.0) builds here. It rebuilt miniz streams bit-exactly with 0.1–6% correction data, analysing at 10–60 MB/s. Not integrated yet, because pack already copies unedited streams verbatim; see the open question in the stage 5 notes.
+- Stage 5B (`unpack.rs`): `zscan unpack FILE -d DIR` / `zscan rebuild DIR -o FILE`, a precomp-style bit-exact round trip.
+  - The directory holds `unpack.json`, `gaps.bin`, `streams/` (contents) and `recon/`.
+  - Each stream uses the first method that reproduces it, checked at unpack time: encode (exact params + original header), then preflate (`preflate-rs` 0.7.6, which needs Rust 1.89: this is why the MSRV is 1.89), then stored verbatim.
+  - Rebuild checks whole-file size and CRC, and refuses edited contents (edits go through pack).
+  - Results: 512 MiB dense archive → unpacked form compresses 33% smaller with zstd -19. 4 GiB unpack 4 s, rebuild 6.5 s. preflate fails on some miniz streams (prediction failure at any chain length); those fall back to stored.
+- Overlap rule for unverified formats (`later_match_wins`): a later match replaces the current one only if it runs further *and* no match starting at or after the current end ends where it does. That second condition keeps back-to-back raw streams, where a misaligned decode from the first one's tail resyncs into the second.
+- `find_params` prunes memLevel from the first block's symbol count (zlib flushes after exactly 2^(memLevel+6) − 1 symbols), which rejects non-zlib streams without searching. It also skips windows larger than the input. Dense-archive scans are still dominated by param matching (~35 MiB/s, mostly xz/zstd level searches); `--no-match` skips it.
 - Raw deflate evidence (`Codec::evidence`) excludes leading stored blocks, so level-0 raw needs `--raw-min-compressed 0 --raw-min-ratio 0`.
 - Inflate uses `miniz_oxide`'s core API directly: O(1) reset per candidate offset, one reused buffer (`DecodeCtx`). Compression uses stock zlib 1.3.2, bundled static via `libz-sys` (`deflater.rs`), because that's what most files were made with. Don't enable zlib-ng: its output differs.
 - Param matching compares only the deflate *body*. Pack reuses each stream's original header bytes (gzip name/mtime/flags, zlib FLEVEL) and recomputes the trailer. Level 0 is matched as a single `compress2`-style call, because stored block sizes depend on output buffering.

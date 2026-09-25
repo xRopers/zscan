@@ -52,6 +52,11 @@ impl Format {
     pub const SCANNABLE: [Format; 7] =
         [Format::Gzip, Format::Zlib, Format::Zstd, Format::Xz, Format::Bzip2, Format::Lz4, Format::Deflate];
 
+    /// gzip, zlib and raw deflate: the formats whose body is a raw deflate stream.
+    pub fn is_deflate_family(self) -> bool {
+        matches!(self, Format::Gzip | Format::Zlib | Format::Deflate)
+    }
+
     /// Whether blind scanning for this format gives trustworthy results.
     pub fn scannable(self) -> bool {
         self != Format::Brotli

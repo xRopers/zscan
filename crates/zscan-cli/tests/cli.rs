@@ -247,9 +247,36 @@ fn fields_then_pack_with_relocation() {
 
     let report = ok_json(&["pack", &input, "-m", manifest, "-d", out_dir, "-o", packed, "--relocate", "--align", "0x10", "--json"]);
     assert_eq!(report["streams"][1]["status"], "repacked");
-    assert!(report["streams"][1]["relocated_to"].as_u64().unwrap() % 16 == 0);
+    assert!(report["streams"][1]["relocated_to"].as_u64().unwrap().is_multiple_of(16));
     assert!(report["output_size"].as_u64().unwrap() > f.data.len() as u64);
     let entries = zscan_fixtures::read_archive(&std::fs::read(packed).unwrap()).unwrap();
     assert_eq!(entries[1], big);
     assert_eq!(entries[0], f.expected[0].payload);
+}
+
+#[test]
+fn unpack_then_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = zscan_fixtures::codecs();
+    let input = write_fixture(tmp.path(), &f);
+    let dir = tmp.path().join("unpacked");
+    let dir = dir.to_str().unwrap();
+    let summary = ok_json(&["unpack", &input, "-d", dir, "--json"]);
+    assert_eq!(summary["streams"], f.expected.len() as u64);
+    assert!(!zscan(&["unpack", &input, "-d", dir]).status.success(), "refuses a non-empty directory");
+
+    let rebuilt = tmp.path().join("rebuilt.bin");
+    let out = zscan(&["rebuild", dir, "-o", rebuilt.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(std::fs::read(&rebuilt).unwrap() == f.data);
+
+    // An edited contents file stops rebuild and leaves no output behind.
+    let index: Value = serde_json::from_str(&std::fs::read_to_string(Path::new(dir).join("unpack.json")).unwrap()).unwrap();
+    let file = index["streams"][0]["file"].as_str().unwrap();
+    std::fs::write(Path::new(dir).join("streams").join(file), b"edited").unwrap();
+    let again = tmp.path().join("again.bin");
+    let out = zscan(&["rebuild", dir, "-o", again.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("use pack"));
+    assert!(!again.exists());
 }

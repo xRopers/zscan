@@ -1,5 +1,5 @@
 {
-  "description": "raw deflate streams (fixed/dynamic and stored) between random filler",
+  "description": "raw deflate streams between random filler, plus a stored one the default filters skip",
   "size": 10022,
   "streams": [
     {
@@ -17,15 +17,6 @@
       "decompressed_size": 4000,
       "format": "deflate",
       "offset": 6836,
-      "original_name": null,
-      "zlib_made": true
-    },
-    {
-      "compressed_size": 1005,
-      "crc32": "0d0da911",
-      "decompressed_size": 1000,
-      "format": "deflate",
-      "offset": 8017,
       "original_name": null,
       "zlib_made": true
     }

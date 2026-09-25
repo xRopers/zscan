@@ -6,14 +6,17 @@
 //!   defaults), then with stronger settings if that doesn't fit the original slot. The
 //!   original header is reused, the trailer recomputed, and leftover space zero-filled.
 //!
-//! Nothing is returned for writing unless every stream fits and every stream in the
-//! output decodes to the intended data.
+//! [`pack`] only plans: it returns the new stream bytes as patches, each already checked
+//! to decode to the edited data, so memory use scales with the edits rather than the
+//! file. [`PackResult::write_to`] streams the output and [`PackResult::verify_output`]
+//! decodes every stream from the file as written.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::checksum::crc32;
@@ -79,24 +82,94 @@ impl StreamPlan {
     }
 }
 
+/// New bytes for one stream slot.
+#[derive(Debug, Clone)]
+struct Patch {
+    offset: usize,
+    bytes: Vec<u8>,
+    /// Zero-fill from the end of `bytes` up to here (the original stream end).
+    clear_to: usize,
+}
+
 #[derive(Debug)]
 pub struct PackResult {
     /// One entry per manifest stream, in offset order.
     pub streams: Vec<StreamPlan>,
-    /// The packed file. `None` if any stream didn't fit.
-    pub data: Option<Vec<u8>>,
-    /// Manifest describing the packed file, so it can be extracted and packed again.
-    /// Its `source.path` is copied from the input manifest; callers should update it.
-    pub manifest: Option<Manifest>,
+    /// In offset order. Empty unless every stream fits.
+    patches: Vec<Patch>,
+    input_len: usize,
+    /// The manifest for the packed output, minus its source size/CRC (known once written).
+    manifest: Manifest,
 }
 
 impl PackResult {
+    /// True if every stream fits, so output can be written.
+    pub fn fits(&self) -> bool {
+        self.failures().next().is_none()
+    }
+
     pub fn failures(&self) -> impl Iterator<Item = &StreamPlan> {
         self.streams.iter().filter(|s| matches!(s.outcome, Outcome::TooLarge { .. }))
     }
 
     pub fn repacked(&self) -> impl Iterator<Item = &StreamPlan> {
         self.streams.iter().filter(|s| matches!(s.outcome, Outcome::Repacked { .. }))
+    }
+
+    /// Stream the packed file to `w`: the input with each patch applied. The output is
+    /// always the same length as the input. `input` must be the data given to [`pack`].
+    pub fn write_to(&self, input: &[u8], mut w: impl Write) -> io::Result<()> {
+        assert!(self.fits(), "write_to called on a pack result with streams that don't fit");
+        assert_eq!(input.len(), self.input_len, "write_to needs the same input that was packed");
+        let mut pos = 0;
+        for patch in &self.patches {
+            w.write_all(&input[pos..patch.offset])?;
+            w.write_all(&patch.bytes)?;
+            let written_to = patch.offset + patch.bytes.len();
+            if written_to < patch.clear_to {
+                io::copy(&mut io::repeat(0).take((patch.clear_to - written_to) as u64), &mut w)?;
+            }
+            pos = written_to.max(patch.clear_to);
+        }
+        w.write_all(&input[pos..])?;
+        w.flush()
+    }
+
+    /// The packed file in memory, or `None` if a stream didn't fit.
+    pub fn apply(&self, input: &[u8]) -> Option<Vec<u8>> {
+        self.fits().then(|| {
+            let mut out = Vec::with_capacity(input.len());
+            self.write_to(input, &mut out).expect("writing to a Vec cannot fail");
+            out
+        })
+    }
+
+    /// Decode every stream from the written `output` and check it against the plan:
+    /// unchanged streams must still match the original manifest, repacked ones must
+    /// decode to exactly the edited data. Returns the manifest for the output, so it
+    /// can be extracted and packed again. Its `source.path` is copied from the input
+    /// manifest; callers should update it.
+    pub fn verify_output(&self, output: &[u8]) -> Result<Manifest> {
+        let largest = self.manifest.streams.iter().map(|s| s.decompressed_size).max().unwrap_or(0);
+        let max_output = usize::try_from(largest).unwrap_or(usize::MAX);
+        self.manifest
+            .streams
+            .par_iter()
+            .map_init(
+                || DecodeCtx::new(max_output),
+                |ctx, entry| {
+                    decode_stream(output, entry, ctx).map(|_| ()).map_err(|e| Error::Verify {
+                        id: entry.id,
+                        offset: entry.offset,
+                        reason: e.to_string(),
+                    })
+                },
+            )
+            .collect::<Result<()>>()?;
+        let mut manifest = self.manifest.clone();
+        manifest.source.size = output.len() as u64;
+        manifest.source.crc32 = crc32(output);
+        Ok(manifest)
     }
 }
 
@@ -121,8 +194,9 @@ pub fn load_edits(dir: &Path, manifest: &Manifest) -> Result<BTreeMap<u32, Vec<u
     Ok(edits)
 }
 
-/// Build the packed file from `data`, the `manifest` it was scanned with, and new
-/// contents for some streams (keyed by stream id).
+/// Plan the packed file from `data`, the `manifest` it was scanned with, and new
+/// contents for some streams (keyed by stream id). Edited streams are compressed in
+/// parallel, and each new stream is decoded again to confirm it holds the edited data.
 pub fn pack(
     data: &[u8],
     manifest: &Manifest,
@@ -143,59 +217,74 @@ pub fn pack(
         .chain(edits.values().map(|v| v.len() as u64))
         .max()
         .unwrap_or(0);
-    let mut ctx = DecodeCtx::new(usize::try_from(largest).unwrap_or(usize::MAX));
-    let mut out = data.to_vec();
-    let mut plans = Vec::with_capacity(streams.len());
+    let max_output = usize::try_from(largest).unwrap_or(usize::MAX);
 
-    for (i, entry) in streams.iter().enumerate() {
-        let mut plan = StreamPlan {
-            id: entry.id,
-            offset: entry.offset,
-            format: entry.format,
-            original_size: entry.compressed_size,
-            outcome: Outcome::Unchanged,
-        };
-        let Some(new_data) = edits.get(&entry.id) else {
-            plans.push(plan);
-            continue;
-        };
+    let planned: Vec<(StreamPlan, Option<Patch>)> = streams
+        .par_iter()
+        .enumerate()
+        .map_init(
+            || DecodeCtx::new(max_output),
+            |ctx, (i, entry)| {
+                let next_start = streams.get(i + 1).map_or(data.len(), |s| s.offset as usize);
+                plan_stream(data, entry, edits.get(&entry.id), next_start, opts, ctx)
+            },
+        )
+        .collect::<Result<_>>()?;
 
-        // Decoding the original confirms it is still intact and locates its header.
-        let original = decode_stream(data, entry, &mut ctx)?;
-        let start = entry.offset as usize;
-        let end = entry.end() as usize;
-        let header = &data[start..start + original.body.start];
-        let next_start = streams.get(i + 1).map_or(data.len(), |s| s.offset as usize);
-        let slack = if opts.use_zero_slack { data[end..next_start].iter().take_while(|&&b| b == 0).count() } else { 0 };
-        let available = end - start + slack;
+    let (plans, patches): (Vec<StreamPlan>, Vec<Option<Patch>>) = planned.into_iter().unzip();
+    let fits = plans.iter().all(|p| !matches!(p.outcome, Outcome::TooLarge { .. }));
+    let patches = if fits { patches.into_iter().flatten().collect() } else { Vec::new() };
+    let manifest = packed_manifest(manifest, &plans, edits);
+    Ok(PackResult { streams: plans, patches, input_len: data.len(), manifest })
+}
 
-        let first = first_params(entry, &original)?;
-        ctx.recycle(original.data);
-        let (stream, params) = fit(codec_for(entry.format), header, new_data, first, available);
+fn plan_stream(
+    data: &[u8],
+    entry: &StreamEntry,
+    edit: Option<&Vec<u8>>,
+    next_start: usize,
+    opts: &PackOptions,
+    ctx: &mut DecodeCtx,
+) -> Result<(StreamPlan, Option<Patch>)> {
+    let mut plan = StreamPlan {
+        id: entry.id,
+        offset: entry.offset,
+        format: entry.format,
+        original_size: entry.compressed_size,
+        outcome: Outcome::Unchanged,
+    };
+    let Some(new_data) = edit else { return Ok((plan, None)) };
 
-        plan.outcome = if stream.len() > available {
-            Outcome::TooLarge { best_size: stream.len() as u64, available: available as u64 }
-        } else {
-            out[start..start + stream.len()].copy_from_slice(&stream);
-            if start + stream.len() < end {
-                out[start + stream.len()..end].fill(0);
-            }
-            Outcome::Repacked {
-                new_size: stream.len() as u64,
-                params,
-                reused_original_params: entry.params.exact_match && params == first,
-                slack_used: (start + stream.len()).saturating_sub(end) as u64,
-            }
-        };
-        plans.push(plan);
+    // Decoding the original confirms it is still intact and locates its header.
+    let original = decode_stream(data, entry, ctx)?;
+    let start = entry.offset as usize;
+    let end = entry.end() as usize;
+    let header = &data[start..start + original.body.start];
+    let slack = if opts.use_zero_slack { data[end..next_start].iter().take_while(|&&b| b == 0).count() } else { 0 };
+    let available = end - start + slack;
+
+    let codec = codec_for(entry.format);
+    let first = first_params(entry, &original)?;
+    let (stream, params) = fit(codec, header, new_data, first, available);
+    if stream.len() > available {
+        plan.outcome = Outcome::TooLarge { best_size: stream.len() as u64, available: available as u64 };
+        return Ok((plan, None));
     }
 
-    if plans.iter().any(|p| matches!(p.outcome, Outcome::TooLarge { .. })) {
-        return Ok(PackResult { streams: plans, data: None, manifest: None });
+    // The new stream must decode, alone, to exactly the edited data.
+    let fail = |reason: String| Error::Verify { id: entry.id, offset: entry.offset, reason };
+    let decoded = codec.decode(&stream, ctx).map_err(|e| fail(format!("{} decode failed: {e}", entry.format)))?;
+    if decoded.compressed_size != stream.len() || decoded.data != *new_data {
+        return Err(fail("re-encoded stream does not decode to the edited data".into()));
     }
-    verify(&out, &streams, &plans, edits, &mut ctx)?;
-    let manifest = packed_manifest(manifest, &plans, edits, &out);
-    Ok(PackResult { streams: plans, data: Some(out), manifest: Some(manifest) })
+
+    plan.outcome = Outcome::Repacked {
+        new_size: stream.len() as u64,
+        params,
+        reused_original_params: entry.params.exact_match && params == first,
+        slack_used: (start + stream.len()).saturating_sub(end) as u64,
+    };
+    Ok((plan, Some(Patch { offset: start, bytes: stream, clear_to: end })))
 }
 
 /// Manifest streams in offset order, checked to be in bounds and non-overlapping.
@@ -253,42 +342,8 @@ fn fit(codec: &dyn Codec, header: &[u8], data: &[u8], first: DeflateParams, avai
     best
 }
 
-/// Decode every stream from the packed output: unchanged ones must still match the
-/// manifest, repacked ones must decode to exactly the edited data.
-fn verify(
-    out: &[u8],
-    streams: &[&StreamEntry],
-    plans: &[StreamPlan],
-    edits: &BTreeMap<u32, Vec<u8>>,
-    ctx: &mut DecodeCtx,
-) -> Result<()> {
-    for (entry, plan) in streams.iter().zip(plans) {
-        let fail = |reason: String| Error::Verify { id: entry.id, offset: entry.offset, reason };
-        let decoded = match plan.outcome {
-            Outcome::Unchanged => decode_stream(out, entry, ctx).map_err(|e| fail(e.to_string()))?,
-            Outcome::Repacked { new_size, .. } => {
-                let decoded = codec_for(entry.format)
-                    .decode(&out[entry.offset as usize..], ctx)
-                    .map_err(|e| fail(format!("{} decode failed: {e}", entry.format)))?;
-                if decoded.compressed_size as u64 != new_size {
-                    return Err(fail(format!("stream is {} bytes, expected {new_size}", decoded.compressed_size)));
-                }
-                if decoded.data != edits[&entry.id] {
-                    return Err(fail("decompressed data differs from the edited file".into()));
-                }
-                decoded
-            }
-            Outcome::TooLarge { .. } => unreachable!("verify only runs when every stream fits"),
-        };
-        ctx.recycle(decoded.data);
-    }
-    Ok(())
-}
-
-fn packed_manifest(original: &Manifest, plans: &[StreamPlan], edits: &BTreeMap<u32, Vec<u8>>, out: &[u8]) -> Manifest {
+fn packed_manifest(original: &Manifest, plans: &[StreamPlan], edits: &BTreeMap<u32, Vec<u8>>) -> Manifest {
     let mut manifest = original.clone();
-    manifest.source.size = out.len() as u64;
-    manifest.source.crc32 = crc32(out);
     for entry in &mut manifest.streams {
         let Some(plan) = plans.iter().find(|p| p.id == entry.id) else { continue };
         if let Outcome::Repacked { new_size, params, .. } = plan.outcome {

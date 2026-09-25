@@ -5,10 +5,10 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use zscan_core::entropy::{entropy_map, shannon};
-use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_MIN_SIZE, DEFAULT_RAW_MAX_ENTROPY, DEFAULT_RAW_MIN_COMPRESSED};
+use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_MIN_SIZE, DEFAULT_RAW_MAX_ENTROPY, DEFAULT_RAW_MIN_COMPRESSED, DEFAULT_RAW_MIN_RATIO};
 use zscan_core::{
-    ExtractOptions, Format, Manifest, Outcome, PackOptions, ScanOptions, SourceInfo, StreamEntry, StreamPlan,
-    extract_all, input, load_edits, pack, scan,
+    ExtractOptions, Format, Manifest, Outcome, PackOptions, PackResult, ScanOptions, ScanStats, SourceInfo, StreamEntry,
+    StreamPlan, extract_all, input, load_edits, pack, scan, scan_with_stats,
 };
 
 #[derive(Parser)]
@@ -17,6 +17,10 @@ struct Cli {
     /// Print machine-readable JSON on stdout instead of text
     #[arg(long, global = true)]
     json: bool,
+
+    /// Worker threads [default: one per CPU]
+    #[arg(short = 'j', long, global = true, value_name = "N")]
+    threads: Option<usize>,
 
     #[command(subcommand)]
     command: Command,
@@ -30,6 +34,9 @@ enum Command {
         /// Write the manifest here
         #[arg(short, long, value_name = "MANIFEST")]
         output: Option<PathBuf>,
+        /// Print time spent per scan phase to stderr
+        #[arg(long)]
+        stats: bool,
         #[command(flatten)]
         filters: ScanArgs,
     },
@@ -100,6 +107,9 @@ struct ScanArgs {
     /// Reject raw deflate whose output entropy is above this, bits per byte (8 disables)
     #[arg(long, default_value_t = DEFAULT_RAW_MAX_ENTROPY)]
     raw_max_entropy: f64,
+    /// Minimum decompressed/compressed ratio for raw deflate (0 finds level-0 streams)
+    #[arg(long, default_value_t = DEFAULT_RAW_MIN_RATIO)]
+    raw_min_ratio: f64,
     /// Minimum decompressed/compressed size ratio
     #[arg(long, default_value_t = 0.0)]
     min_ratio: f64,
@@ -121,6 +131,7 @@ impl ScanArgs {
             min_size: self.min_size,
             raw_min_compressed: self.raw_min_compressed,
             raw_max_entropy: (self.raw_max_entropy < 8.0).then_some(self.raw_max_entropy),
+            raw_min_ratio: self.raw_min_ratio,
             min_ratio: self.min_ratio,
             max_entropy: self.max_entropy,
             max_output: self.max_output,
@@ -140,8 +151,11 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if let Some(n) = cli.threads {
+        rayon::ThreadPoolBuilder::new().num_threads(n.max(1)).build_global()?;
+    }
     match cli.command {
-        Command::Scan { file, output, filters } => cmd_scan(&file, output.as_deref(), &filters, cli.json),
+        Command::Scan { file, output, stats, filters } => cmd_scan(&file, output.as_deref(), stats, &filters, cli.json),
         Command::Extract { file, manifest, dir, force, filters } => {
             cmd_extract(&file, manifest.as_deref(), &dir, force, &filters, cli.json)
         }
@@ -159,9 +173,14 @@ fn build_manifest(file: &Path, data: &[u8], opts: ScanOptions) -> Manifest {
     Manifest::new(SourceInfo::describe(file, data), opts, found)
 }
 
-fn cmd_scan(file: &Path, output: Option<&Path>, filters: &ScanArgs, json: bool) -> Result<()> {
+fn cmd_scan(file: &Path, output: Option<&Path>, stats: bool, filters: &ScanArgs, json: bool) -> Result<()> {
     let data = input::open(file)?;
-    let manifest = build_manifest(file, &data, filters.options());
+    let opts = filters.options();
+    let (found, scan_stats) = scan_with_stats(&data, &opts);
+    let manifest = Manifest::new(SourceInfo::describe(file, &data), opts, found);
+    if stats {
+        print_stats(&scan_stats);
+    }
     if let Some(out) = output {
         if same_file(out, file) {
             bail!("refusing to write the manifest over the input file");
@@ -328,15 +347,12 @@ fn cmd_pack(
     let result = pack(&data, &manifest, &edits, opts)?;
 
     let mut written = None;
-    if !dry_run {
-        if let (Some(packed), Some(packed_manifest)) = (&result.data, &result.manifest) {
-            write_via_temp(output, packed)?;
-            written = Some(output.display().to_string());
-            if let Some(path) = manifest_out {
-                let mut packed_manifest = packed_manifest.clone();
-                packed_manifest.source.path = output.display().to_string();
-                packed_manifest.save(path)?;
-            }
+    if !dry_run && result.fits() {
+        let mut packed_manifest = write_verified(output, &data, &result)?;
+        written = Some(output.display().to_string());
+        if let Some(path) = manifest_out {
+            packed_manifest.source.path = output.display().to_string();
+            packed_manifest.save(path)?;
         }
     }
 
@@ -353,7 +369,7 @@ fn cmd_pack(
         }
         match (&written, dry_run) {
             (Some(path), _) => println!("written to {path} (every stream verified)"),
-            (None, true) if result.data.is_some() => println!("dry run: everything fits and verifies; nothing written"),
+            (None, true) if result.fits() => println!("dry run: every new stream fits and decodes correctly; nothing written"),
             _ => {}
         }
     }
@@ -420,18 +436,46 @@ fn default_packed_path(input: &Path) -> PathBuf {
     input.with_file_name(name)
 }
 
-/// Write to a temporary file next to `path`, then rename, so a failed write never
-/// leaves a half-written output behind.
-fn write_via_temp(path: &Path, data: &[u8]) -> Result<()> {
+/// Stream the packed file to a temporary file next to `path`, read it back and verify
+/// every stream, then rename it into place. A failed write or verify never leaves a
+/// half-written or wrong output behind. Returns the manifest for the output.
+fn write_verified(path: &Path, input_data: &[u8], result: &PackResult) -> Result<Manifest> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".zscan-tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, data).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+    let outcome = (|| -> Result<Manifest> {
+        let file = std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+        result
+            .write_to(input_data, std::io::BufWriter::with_capacity(8 << 20, file))
+            .map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+        // The mapping must be dropped before the rename (Windows won't rename a mapped file).
+        let written = input::open(&tmp)?;
+        Ok(result.verify_output(&written)?)
+    })();
+    let manifest = match outcome {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         bail!("{}: {e}", path.display());
     }
-    Ok(())
+    Ok(manifest)
+}
+
+fn print_stats(stats: &ScanStats) {
+    let mib = stats.bytes as f64 / (1 << 20) as f64;
+    let phase = |name: &str, d: std::time::Duration| {
+        eprintln!("  {name:<16} {:>9.2} s  {:>9.1} MiB/s", d.as_secs_f64(), mib / d.as_secs_f64().max(1e-9));
+    };
+    eprintln!("scan of {mib:.1} MiB:");
+    phase("gzip/zlib pass", stats.verified_pass);
+    phase("raw deflate pass", stats.raw_pass);
+    phase("param matching", stats.param_matching);
+    phase("total", stats.total());
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

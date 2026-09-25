@@ -289,10 +289,11 @@ pub fn deflate_raw() -> Fixture {
     let p = b.records(4000);
     b.stream(Kind::Deflate, deflate(&p, 9), p, None);
     b.zeros(64);
+    // Stored (level 0) raw deflate: only found with the raw ratio filter off.
     let p = b.text(1000);
-    b.stream(Kind::Deflate, deflate(&p, 0), p, None);
+    b.raw(&deflate(&p, 0));
     b.random(1000);
-    b.finish("deflate_raw", "raw deflate streams (fixed/dynamic and stored) between random filler")
+    b.finish("deflate_raw", "raw deflate streams between random filler, plus a stored one the default filters skip")
 }
 
 pub fn mixed() -> Fixture {

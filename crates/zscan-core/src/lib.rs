@@ -23,4 +23,4 @@ pub use error::{Error, Result};
 pub use extract::{ExtractOptions, ExtractedFile, decode_stream, extract_all};
 pub use manifest::{Manifest, SourceInfo, StreamEntry};
 pub use pack::{Outcome, PackOptions, PackResult, StreamPlan, load_edits, pack};
-pub use scan::{FoundStream, ScanOptions, scan};
+pub use scan::{FoundStream, ScanOptions, ScanStats, scan, scan_with_stats};

@@ -24,6 +24,9 @@ pub enum Error {
     #[error("verification failed for stream {id} at offset {offset:#x}: {reason}")]
     Verify { id: u32, offset: u64, reason: String },
 
+    #[error("cannot pack: {0}")]
+    Pack(String),
+
     #[error("manifest names an unsafe output file {0:?} (must be a plain file name)")]
     BadFilename(String),
 }

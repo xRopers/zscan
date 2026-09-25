@@ -5,12 +5,18 @@
 //! - Edited: the new data is encoded with the settings matched at scan time (or defaults
 //!   taken from the original header), then with stronger settings if that doesn't fit
 //!   the original slot. Header fields are reused where the format allows, and leftover
-//!   space is zero-filled.
+//!   space is zero-filled. If it still doesn't fit, it may grow into zero slack after it
+//!   (opt-in), or, if the stream has an offset field and relocation is enabled, move to
+//!   the end of the file, leaving its old slot zeroed.
 //!
-//! [`pack`] only plans: it returns the new stream bytes as patches, each already checked
-//! to decode to the edited data, so memory use scales with the edits rather than the
-//! file. [`PackResult::write_to`] streams the output and [`PackResult::verify_output`]
-//! decodes every stream from the file as written.
+//! Length fields ([`crate::fields`]) are checked before anything is planned and
+//! rewritten to the new sizes and offsets.
+//!
+//! [`pack`] only plans: it returns the changes as patches, each new stream already
+//! checked to decode to the edited data, so memory use scales with the edits rather
+//! than the file. [`PackResult::write_to`] streams the output and
+//! [`PackResult::verify_output`] decodes every stream and rechecks every field in the
+//! file as written.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,7 +30,8 @@ use crate::checksum::crc32;
 use crate::codec::{Codec, DecodeCtx, Decoded, Format, codec_for};
 use crate::error::{Error, Result, io_err};
 use crate::extract::decode_stream;
-use crate::manifest::{Manifest, StreamEntry, is_safe_filename};
+use crate::fields::{check_fields, measure, measure_name};
+use crate::manifest::{Manifest, Measures, StreamEntry, is_safe_filename};
 use crate::params::EncoderParams;
 
 #[derive(Debug, Clone)]
@@ -32,13 +39,20 @@ pub struct PackOptions {
     /// Refuse to run if the input's size or CRC-32 differs from the manifest.
     pub verify_source: bool,
     /// Let a stream grow into the zero bytes that follow it (never past the next stream).
-    /// Only safe when whatever reads the file finds the stream's end by decoding it.
+    /// Only safe when whatever reads the file finds the stream's end by decoding it, or
+    /// reads its size from a length field.
     pub use_zero_slack: bool,
+    /// Move a stream that doesn't fit to the end of the file, if it has offset and
+    /// compressed-size fields and no field just in front of it (a local header, which
+    /// would be left behind). The file grows.
+    pub relocate: bool,
+    /// Alignment for relocated streams (1 = none).
+    pub align: u64,
 }
 
 impl Default for PackOptions {
     fn default() -> Self {
-        Self { verify_source: true, use_zero_slack: false }
+        Self { verify_source: true, use_zero_slack: false, relocate: false, align: 1 }
     }
 }
 
@@ -54,9 +68,18 @@ pub enum Outcome {
         reused_original_params: bool,
         /// Bytes of trailing zero slack the new stream grew into.
         slack_used: u64,
+        /// Where the stream moved to, if it didn't fit in place.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        relocated_to: Option<u64>,
     },
     /// Even the strongest settings tried don't fit.
-    TooLarge { best_size: u64, available: u64 },
+    TooLarge {
+        best_size: u64,
+        available: u64,
+        /// The stream has offset and compressed-size fields and no local header, so
+        /// relocation would work.
+        relocatable: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,22 +106,41 @@ impl StreamPlan {
     }
 }
 
-/// New bytes for one stream slot.
+/// A length field whose value pack changes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FieldUpdate {
+    pub stream_id: u32,
+    pub offset: u64,
+    pub measures: Measures,
+    pub old: u64,
+    pub new: u64,
+}
+
+/// New bytes at one place in the output.
 #[derive(Debug, Clone)]
 struct Patch {
     offset: usize,
     bytes: Vec<u8>,
-    /// Zero-fill from the end of `bytes` up to here (the original stream end).
+    /// Zero-fill from the end of `bytes` up to here.
     clear_to: usize,
+}
+
+impl Patch {
+    fn end(&self) -> usize {
+        (self.offset + self.bytes.len()).max(self.clear_to)
+    }
 }
 
 #[derive(Debug)]
 pub struct PackResult {
     /// One entry per manifest stream, in offset order.
     pub streams: Vec<StreamPlan>,
-    /// In offset order. Empty unless every stream fits.
+    /// Length fields that change, in offset order. Empty unless every stream fits.
+    pub field_updates: Vec<FieldUpdate>,
+    /// In offset order, non-overlapping. Empty unless every stream fits.
     patches: Vec<Patch>,
     input_len: usize,
+    output_len: usize,
     /// The manifest for the packed output, minus its source size/CRC (known once written).
     manifest: Manifest,
 }
@@ -117,40 +159,58 @@ impl PackResult {
         self.streams.iter().filter(|s| matches!(s.outcome, Outcome::Repacked { .. }))
     }
 
-    /// Stream the packed file to `w`: the input with each patch applied. The output is
-    /// always the same length as the input. `input` must be the data given to [`pack`].
+    /// Size of the packed file: the input's, unless streams were relocated.
+    pub fn output_len(&self) -> u64 {
+        self.output_len as u64
+    }
+
+    /// Stream the packed file to `w`: the input with each patch applied, then any
+    /// relocated streams. `input` must be the data given to [`pack`].
     pub fn write_to(&self, input: &[u8], mut w: impl Write) -> io::Result<()> {
         assert!(self.fits(), "write_to called on a pack result with streams that don't fit");
         assert_eq!(input.len(), self.input_len, "write_to needs the same input that was packed");
+        let copy = |w: &mut dyn Write, from: usize, to: usize| -> io::Result<()> {
+            if from >= to {
+                return Ok(());
+            }
+            let split = to.min(input.len()).max(from);
+            w.write_all(&input[from..split])?;
+            io::copy(&mut io::repeat(0).take((to - split) as u64), w).map(|_| ())
+        };
         let mut pos = 0;
         for patch in &self.patches {
-            w.write_all(&input[pos..patch.offset])?;
+            copy(&mut w, pos, patch.offset)?;
             w.write_all(&patch.bytes)?;
             let written_to = patch.offset + patch.bytes.len();
-            if written_to < patch.clear_to {
-                io::copy(&mut io::repeat(0).take((patch.clear_to - written_to) as u64), &mut w)?;
-            }
-            pos = written_to.max(patch.clear_to);
+            io::copy(&mut io::repeat(0).take(patch.clear_to.saturating_sub(written_to) as u64), &mut w)?;
+            pos = patch.end();
         }
-        w.write_all(&input[pos..])?;
+        copy(&mut w, pos, self.output_len)?;
         w.flush()
     }
 
     /// The packed file in memory, or `None` if a stream didn't fit.
     pub fn apply(&self, input: &[u8]) -> Option<Vec<u8>> {
         self.fits().then(|| {
-            let mut out = Vec::with_capacity(input.len());
+            let mut out = Vec::with_capacity(self.output_len);
             self.write_to(input, &mut out).expect("writing to a Vec cannot fail");
             out
         })
     }
 
-    /// Decode every stream from the written `output` and check it against the plan:
-    /// unchanged streams must still match the original manifest, repacked ones must
-    /// decode to exactly the edited data. Returns the manifest for the output, so it
-    /// can be extracted and packed again. Its `source.path` is copied from the input
-    /// manifest; callers should update it.
+    /// Check the written `output` against the plan: every stream decodes to its intended
+    /// data (unchanged ones to the original, repacked ones to the edit) at its new
+    /// offset, and every length field holds its new value. Returns the manifest for the
+    /// output, so it can be extracted and packed again. Its `source.path` is copied from
+    /// the input manifest; callers should update it.
     pub fn verify_output(&self, output: &[u8]) -> Result<Manifest> {
+        if output.len() != self.output_len {
+            return Err(Error::Verify {
+                id: 0,
+                offset: 0,
+                reason: format!("output is {} bytes, expected {}", output.len(), self.output_len),
+            });
+        }
         let largest = self.manifest.streams.iter().map(|s| s.decompressed_size).max().unwrap_or(0);
         let max_output = usize::try_from(largest).unwrap_or(usize::MAX);
         self.manifest
@@ -167,6 +227,8 @@ impl PackResult {
                 },
             )
             .collect::<Result<()>>()?;
+        check_fields(output, &self.manifest)
+            .map_err(|e| Error::Verify { id: 0, offset: 0, reason: format!("length fields: {e}") })?;
         let mut manifest = self.manifest.clone();
         manifest.source.size = output.len() as u64;
         manifest.source.crc32 = crc32(output);
@@ -195,6 +257,12 @@ pub fn load_edits(dir: &Path, manifest: &Manifest) -> Result<BTreeMap<u32, Vec<u
     Ok(edits)
 }
 
+/// A new stream and whether it has to move.
+struct Encoded {
+    bytes: Vec<u8>,
+    relocate: bool,
+}
+
 /// Plan the packed file from `data`, the `manifest` it was scanned with, and new
 /// contents for some streams (keyed by stream id). Edited streams are compressed in
 /// parallel, and each new stream is decoded again to confirm it holds the edited data.
@@ -211,6 +279,9 @@ pub fn pack(
     if let Some(id) = edits.keys().find(|id| !manifest.streams.iter().any(|s| s.id == **id)) {
         return Err(Error::InvalidManifest(format!("edit given for unknown stream id {id}")));
     }
+    // Wrong rules would corrupt the file, so they must describe it exactly.
+    check_fields(data, manifest)?;
+    let align = opts.align.max(1) as usize;
 
     let largest = streams
         .iter()
@@ -220,7 +291,7 @@ pub fn pack(
         .unwrap_or(0);
     let max_output = usize::try_from(largest).unwrap_or(usize::MAX);
 
-    let planned: Vec<(StreamPlan, Option<Patch>)> = streams
+    let planned: Vec<(StreamPlan, Option<Encoded>)> = streams
         .par_iter()
         .enumerate()
         .map_init(
@@ -232,11 +303,61 @@ pub fn pack(
         )
         .collect::<Result<_>>()?;
 
-    let (plans, patches): (Vec<StreamPlan>, Vec<Option<Patch>>) = planned.into_iter().unzip();
+    let mut plans = Vec::with_capacity(planned.len());
+    let mut patches = Vec::new();
+    let mut output_len = data.len();
+    for (mut plan, encoded) in planned {
+        if let Some(Encoded { bytes, relocate }) = encoded {
+            let start = plan.offset as usize;
+            let end = start + plan.original_size as usize;
+            if relocate {
+                let new_offset = output_len.next_multiple_of(align);
+                output_len = new_offset + bytes.len();
+                if let Outcome::Repacked { relocated_to, .. } = &mut plan.outcome {
+                    *relocated_to = Some(new_offset as u64);
+                }
+                patches.push(Patch { offset: start, bytes: Vec::new(), clear_to: end });
+                patches.push(Patch { offset: new_offset, bytes, clear_to: 0 });
+            } else {
+                patches.push(Patch { offset: start, bytes, clear_to: end });
+            }
+        }
+        plans.push(plan);
+    }
+
     let fits = plans.iter().all(|p| !matches!(p.outcome, Outcome::TooLarge { .. }));
-    let patches = if fits { patches.into_iter().flatten().collect() } else { Vec::new() };
-    let manifest = packed_manifest(manifest, &plans, edits);
-    Ok(PackResult { streams: plans, patches, input_len: data.len(), manifest })
+    let packed = packed_manifest(manifest, &plans, edits);
+    let mut field_updates = Vec::new();
+    if fits {
+        for entry in &packed.streams {
+            for f in &entry.length_fields {
+                let new = measure(entry, f.measures);
+                let bytes = f.encode(new).ok_or_else(|| {
+                    Error::Pack(format!(
+                        "stream {}: its new {} ({new}) doesn't fit the {}-byte field at {:#x}",
+                        entry.id,
+                        measure_name(f.measures),
+                        f.width,
+                        f.offset
+                    ))
+                })?;
+                let old = f.read(data).expect("checked by check_fields");
+                if f.stored_value(new) != Some(old) {
+                    field_updates.push(FieldUpdate { stream_id: entry.id, offset: f.offset, measures: f.measures, old, new: f.stored_value(new).unwrap() });
+                    patches.push(Patch { offset: f.offset as usize, bytes, clear_to: 0 });
+                }
+            }
+        }
+    } else {
+        patches.clear();
+        output_len = data.len();
+    }
+    patches.sort_by_key(|p| p.offset);
+    field_updates.sort_by_key(|u| u.offset);
+    if let Some(w) = patches.windows(2).find(|w| w[0].end() > w[1].offset) {
+        return Err(Error::Pack(format!("internal error: changes at {:#x} and {:#x} overlap", w[0].offset, w[1].offset)));
+    }
+    Ok(PackResult { streams: plans, field_updates, patches, input_len: data.len(), output_len, manifest: packed })
 }
 
 fn plan_stream(
@@ -246,7 +367,7 @@ fn plan_stream(
     next_start: usize,
     opts: &PackOptions,
     ctx: &mut DecodeCtx,
-) -> Result<(StreamPlan, Option<Patch>)> {
+) -> Result<(StreamPlan, Option<Encoded>)> {
     let mut plan = StreamPlan {
         id: entry.id,
         offset: entry.offset,
@@ -272,8 +393,10 @@ fn plan_stream(
         None => codec.default_params(old_stream, &original),
     };
     let (stream, params) = fit(codec, old_stream, &original, new_data, &first, available);
-    if stream.len() > available {
-        plan.outcome = Outcome::TooLarge { best_size: stream.len() as u64, available: available as u64 };
+    let relocatable = can_relocate(entry);
+    let relocate = stream.len() > available;
+    if relocate && !(opts.relocate && relocatable) {
+        plan.outcome = Outcome::TooLarge { best_size: stream.len() as u64, available: available as u64, relocatable };
         return Ok((plan, None));
     }
 
@@ -288,9 +411,21 @@ fn plan_stream(
         new_size: stream.len() as u64,
         reused_original_params: entry.exact_params.is_some() && params == first,
         params,
-        slack_used: (start + stream.len()).saturating_sub(end) as u64,
+        slack_used: if relocate { 0 } else { (start + stream.len()).saturating_sub(end) as u64 },
+        relocated_to: None, // assigned once every stream is planned
     };
-    Ok((plan, Some(Patch { offset: start, bytes: stream, clear_to: end })))
+    Ok((plan, Some(Encoded { bytes: stream, relocate })))
+}
+
+/// A stream can move if fields record both where it is and how long it is (a reader
+/// can't otherwise find it, or would read the old length), and no field sits right in
+/// front of it: that would be a local header, which a reader expects just before the
+/// data but which relocation leaves behind.
+fn can_relocate(entry: &StreamEntry) -> bool {
+    const LOCAL_HEADER: u64 = 16;
+    let has = |m: Measures| entry.length_fields.iter().any(|f| f.measures == m);
+    let local_header = entry.length_fields.iter().any(|f| f.end() <= entry.offset && f.end() + LOCAL_HEADER > entry.offset);
+    has(Measures::Offset) && has(Measures::Compressed) && !local_header
 }
 
 /// Manifest streams in offset order, checked to be in bounds and non-overlapping.
@@ -339,14 +474,18 @@ fn packed_manifest(original: &Manifest, plans: &[StreamPlan], edits: &BTreeMap<u
     let mut manifest = original.clone();
     for entry in &mut manifest.streams {
         let Some(plan) = plans.iter().find(|p| p.id == entry.id) else { continue };
-        if let Outcome::Repacked { new_size, params, .. } = &plan.outcome {
+        if let Outcome::Repacked { new_size, params, relocated_to, .. } = &plan.outcome {
             let new_data = &edits[&entry.id];
             entry.compressed_size = *new_size;
             entry.decompressed_size = new_data.len() as u64;
             entry.crc32 = crc32(new_data);
             // The new stream was made with exactly these settings.
             entry.exact_params = Some(params.clone());
+            if let Some(offset) = relocated_to {
+                entry.offset = *offset;
+            }
         }
     }
+    manifest.streams.sort_by_key(|s| s.offset);
     manifest
 }

@@ -53,15 +53,23 @@ pub struct StreamEntry {
     pub length_fields: Vec<LengthField>,
 }
 
-/// A field elsewhere in the file that records this stream's size.
-/// Recorded only for now; pack starts honouring these in build stage 5.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A field elsewhere in the file that records something about this stream: its
+/// compressed size, decompressed size or offset. It holds `value + adjust`, so a size
+/// that includes a header or an offset relative to a base can be described. Pack keeps
+/// fields up to date when a stream changes size or moves; see [`crate::fields`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LengthField {
     pub offset: u64,
     /// Width in bytes (1, 2, 4 or 8).
     pub width: u8,
     pub endian: Endian,
     pub measures: Measures,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub adjust: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,11 +79,13 @@ pub enum Endian {
     Big,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Measures {
     Compressed,
     Decompressed,
+    /// The stream's absolute offset in the file.
+    Offset,
 }
 
 impl SourceInfo {

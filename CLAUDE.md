@@ -56,7 +56,7 @@ All commands support `--json` output for scripting.
 6. GUI (egui for speed of building, or Tauri for a richer hex/preview UI): entropy map, stream table (offset, format, sizes, ratio, detected type, exact-match flag), preview pane (hex/text/image), mark edited streams, pack view with dry-run + verify, save/load manifest as a project.
 
 ## Status
-- Stages 1–4 done: `zscan scan | extract | pack | try | info`. Formats: gzip, zlib, raw deflate, zstd, xz, bzip2, lz4 frame, and brotli (not scannable; add with `zscan try`).
+- Stages 1–4 done: `zscan scan | extract | pack | try | fields | info`. Formats: gzip, zlib, raw deflate, zstd, xz, bzip2, lz4 frame, and brotli (not scannable; add with `zscan try`).
 - Codec trait (stage 4): each format file owns probe/decode plus `find_params` (exact match), `default_params` (derived from the original header), `adapt_params`, `stronger_params` and `encode`. Params are the tagged `EncoderParams` enum (`params.rs`). Manifest v2 stores `exact_params`, and v1 manifests are migrated on load.
 - Exact matching per format:
   - zstd: level search with header flags. Frames without a content size need the streaming (`e_continue` then `e_end`) path.
@@ -65,6 +65,12 @@ All commands support `--json` output for scripting.
   - lz4: lz4_flex only; reference-lz4 frames decode and repack but don't match.
   - brotli: quality × mode.
 - Brotli is never scanned for (`Format::scannable`): blind scanning measured ~1 MiB/s and ~1 FP per 4 MiB. Streams are added at known offsets with `decode_at` / `zscan try --at <off> --format brotli -m m.json`, then extract and pack normally.
+- Length fields (stage 5A, `fields.rs`): per-stream fields recording compressed size, decompressed size or offset, each as `value + adjust` at offset/width/endian.
+  - Pack refuses to start unless every field holds its current value, then rewrites the fields that change.
+  - `zscan fields --apply` detects candidates: integers just before a stream (any value), or anywhere for values ≥ `--min-value`. It keeps only locations claimed once; a quantity may legitimately have several fields.
+  - `--relocate` moves a stream that doesn't fit to the end of the file. It requires offset + compressed-size fields and no field in the 16 bytes in front (a local header would be left behind).
+  - The tests read packed archives with an independent reader (`zscan_fixtures::read_archive`).
+- Stage 5B (preflate): `preflate-rs` 0.7.6 (Microsoft, Apache-2.0) builds here. It rebuilt miniz streams bit-exactly with 0.1–6% correction data, analysing at 10–60 MB/s. Not integrated yet, because pack already copies unedited streams verbatim; see the open question in the stage 5 notes.
 - Raw deflate evidence (`Codec::evidence`) excludes leading stored blocks, so level-0 raw needs `--raw-min-compressed 0 --raw-min-ratio 0`.
 - Inflate uses `miniz_oxide`'s core API directly: O(1) reset per candidate offset, one reused buffer (`DecodeCtx`). Compression uses stock zlib 1.3.2, bundled static via `libz-sys` (`deflater.rs`), because that's what most files were made with. Don't enable zlib-ng: its output differs.
 - Param matching compares only the deflate *body*. Pack reuses each stream's original header bytes (gzip name/mtime/flags, zlib FLEVEL) and recomputes the trailer. Level 0 is matched as a single `compress2`-style call, because stored block sizes depend on output buffering.

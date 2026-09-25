@@ -217,3 +217,39 @@ fn brotli_via_try_then_extract_and_pack() {
     let report = ok_json(&["pack", &input, "-m", manifest, "-d", out_dir.to_str().unwrap(), "-o", packed.to_str().unwrap(), "--json"]);
     assert_eq!(report["streams"][0]["status"], "repacked");
 }
+
+#[test]
+fn fields_then_pack_with_relocation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = zscan_fixtures::archive(false);
+    let input = write_fixture(tmp.path(), &f);
+    let manifest = tmp.path().join("m.json");
+    let manifest = manifest.to_str().unwrap();
+    let out_dir = tmp.path().join("out");
+    let out_dir = out_dir.to_str().unwrap();
+    assert!(zscan(&["scan", &input, "-o", manifest]).status.success());
+
+    let fields = ok_json(&["fields", &input, "-m", manifest, "--window", "8", "--min-value", "2048", "--apply", "--json"]);
+    assert!(!fields["added"].as_array().unwrap().is_empty());
+
+    // Replace entry 1 with data that can't fit its slot.
+    ok_json(&["extract", &input, "-m", manifest, "-d", out_dir, "--json"]);
+    let scanned: Value = serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
+    let file = scanned["streams"][1]["file"].as_str().unwrap();
+    let big = zscan_fixtures::Rng::new(9).bytes(30_000);
+    std::fs::write(Path::new(out_dir).join(file), &big).unwrap();
+
+    let packed = tmp.path().join("p.zarc");
+    let packed = packed.to_str().unwrap();
+    let refused = zscan(&["pack", &input, "-m", manifest, "-d", out_dir, "-o", packed]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--relocate"));
+
+    let report = ok_json(&["pack", &input, "-m", manifest, "-d", out_dir, "-o", packed, "--relocate", "--align", "0x10", "--json"]);
+    assert_eq!(report["streams"][1]["status"], "repacked");
+    assert!(report["streams"][1]["relocated_to"].as_u64().unwrap() % 16 == 0);
+    assert!(report["output_size"].as_u64().unwrap() > f.data.len() as u64);
+    let entries = zscan_fixtures::read_archive(&std::fs::read(packed).unwrap()).unwrap();
+    assert_eq!(entries[1], big);
+    assert_eq!(entries[0], f.expected[0].payload);
+}

@@ -7,7 +7,8 @@ use serde::Serialize;
 use zscan_core::entropy::{entropy_map, shannon};
 use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_MIN_SIZE, DEFAULT_RAW_MAX_ENTROPY, DEFAULT_RAW_MIN_COMPRESSED, DEFAULT_RAW_MIN_RATIO};
 use zscan_core::{
-    ExtractOptions, Format, Manifest, Outcome, PackOptions, PackResult, ScanOptions, ScanStats, SourceInfo, StreamEntry,
+    DetectOptions, ExtractOptions, FieldCandidate, FieldUpdate, Format, Manifest, Outcome, PackOptions, PackResult,
+    ScanOptions, apply_unambiguous, check_fields, detect_fields, ScanStats, SourceInfo, StreamEntry,
     StreamPlan, decode_at, extract_all, input, load_edits, pack, scan, scan_with_stats,
 };
 
@@ -75,12 +76,38 @@ enum Command {
         #[arg(long, value_name = "MANIFEST")]
         manifest_out: Option<PathBuf>,
         /// Let a stream grow into zero bytes that follow it. Only safe if whatever reads
-        /// the file finds the stream's end by decoding it, not from a stored size
+        /// the file finds the stream's end by decoding it, or reads its size from a
+        /// length field in the manifest
         #[arg(long)]
         use_slack: bool,
+        /// Move a stream that doesn't fit to the end of the file (which grows), if the
+        /// manifest lists offset and compressed-size fields for it
+        #[arg(long)]
+        relocate: bool,
+        /// Alignment for relocated streams
+        #[arg(long, default_value_t = 1, value_parser = parse_offset)]
+        align: u64,
         /// Pack even if the input's size or CRC no longer matches the manifest
         #[arg(long)]
         force: bool,
+    },
+    /// Find fields that record each stream's sizes or offset (size prefixes, archive
+    /// directories); `--apply` adds the unambiguous ones to the manifest so pack keeps them
+    /// up to date
+    Fields {
+        file: PathBuf,
+        /// Manifest from `zscan scan -o`
+        #[arg(short, long)]
+        manifest: PathBuf,
+        /// Bytes before each stream searched for size fields of any value
+        #[arg(long, default_value_t = 64)]
+        window: u64,
+        /// Elsewhere in the file, only look for values at least this large
+        #[arg(long, default_value_t = 65_536)]
+        min_value: u64,
+        /// Add unambiguous candidates to the manifest
+        #[arg(long)]
+        apply: bool,
     },
     /// Try decoding one format at an exact offset, and optionally add the stream to a
     /// manifest. For formats that can't be scanned for (brotli), or to check a location
@@ -180,10 +207,13 @@ fn run(cli: Cli) -> Result<()> {
         Command::Extract { file, manifest, dir, force, filters } => {
             cmd_extract(&file, manifest.as_deref(), &dir, force, &filters, cli.json)
         }
-        Command::Pack { file, manifest, dir, output, dry_run, manifest_out, use_slack, force } => {
+        Command::Pack { file, manifest, dir, output, dry_run, manifest_out, use_slack, relocate, align, force } => {
             let output = output.unwrap_or_else(|| default_packed_path(&file));
-            let opts = PackOptions { verify_source: !force, use_zero_slack: use_slack };
+            let opts = PackOptions { verify_source: !force, use_zero_slack: use_slack, relocate, align };
             cmd_pack(&file, &manifest, &dir, &output, manifest_out.as_deref(), dry_run, &opts, cli.json)
+        }
+        Command::Fields { file, manifest, window, min_value, apply } => {
+            cmd_fields(&file, &manifest, &DetectOptions { window, min_global_value: min_value }, apply, cli.json)
         }
         Command::Try { file, at, format, manifest, no_match } => {
             cmd_try(&file, at, format, manifest.as_deref(), !no_match, cli.json)
@@ -348,7 +378,9 @@ fn print_streams(streams: &[StreamEntry]) {
 struct PackReport<'a> {
     dry_run: bool,
     written: Option<String>,
+    output_size: u64,
     streams: &'a [StreamPlan],
+    field_updates: &'a [FieldUpdate],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -381,13 +413,25 @@ fn cmd_pack(
     }
 
     if json {
-        let report = PackReport { dry_run, written: written.clone(), streams: &result.streams };
+        let report = PackReport {
+            dry_run,
+            written: written.clone(),
+            output_size: result.output_len(),
+            streams: &result.streams,
+            field_updates: &result.field_updates,
+        };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_pack_plan(&result.streams);
+        for u in &result.field_updates {
+            println!("  field at {:#010x} (stream {} {:?}): {} -> {}", u.offset, u.stream_id, u.measures, u.old, u.new);
+        }
         let repacked = result.repacked().count();
         let unchanged = result.streams.len() - repacked - result.failures().count();
-        println!("{repacked} stream(s) repacked, {unchanged} unchanged");
+        println!("{repacked} stream(s) repacked, {unchanged} unchanged, {} field(s) updated", result.field_updates.len());
+        if result.fits() && result.output_len() != data.len() as u64 {
+            println!("the file grows from {} to {} bytes", data.len(), result.output_len());
+        }
         if edits.is_empty() {
             println!("no edited files found in {}", dir.display());
         }
@@ -401,9 +445,14 @@ fn cmd_pack(
     let failures: Vec<String> = result
         .failures()
         .map(|s| {
-            let Outcome::TooLarge { best_size, available } = s.outcome else { unreachable!() };
+            let Outcome::TooLarge { best_size, available, relocatable } = s.outcome else { unreachable!() };
+            let hint = if relocatable {
+                "; its fields allow --relocate, which would move it to the end of the file"
+            } else {
+                "; --relocate needs offset and compressed-size fields for it (zscan fields) and no local header"
+            };
             format!(
-                "stream {} at {:#x}: {} bytes over (smallest encoding is {best_size} bytes, slot is {available})",
+                "stream {} at {:#x}: {} bytes over (smallest encoding is {best_size} bytes, slot is {available}){hint}",
                 s.id,
                 s.offset,
                 best_size - available
@@ -424,7 +473,7 @@ fn print_pack_plan(streams: &[StreamPlan]) {
     for s in streams {
         let (status, detail) = match &s.outcome {
             Outcome::Unchanged => ("unchanged", String::new()),
-            Outcome::Repacked { params, reused_original_params, slack_used, .. } => {
+            Outcome::Repacked { params, reused_original_params, slack_used, relocated_to, .. } => {
                 let mut detail = params.to_string();
                 if *reused_original_params {
                     detail += " (original)";
@@ -432,9 +481,12 @@ fn print_pack_plan(streams: &[StreamPlan]) {
                 if *slack_used > 0 {
                     detail += &format!(", {slack_used} bytes of slack");
                 }
-                ("repacked", detail)
+                if let Some(to) = relocated_to {
+                    detail += &format!(", moved to {to:#x}");
+                }
+                (if relocated_to.is_some() { "relocated" } else { "repacked" }, detail)
             }
-            Outcome::TooLarge { best_size, available } => ("TOO LARGE", format!("{} bytes over", best_size - available)),
+            Outcome::TooLarge { best_size, available, .. } => ("TOO LARGE", format!("{} bytes over", best_size - available)),
         };
         let delta = if s.outcome == Outcome::Unchanged { String::new() } else { format!("{:+}", s.delta()) };
         println!(
@@ -488,6 +540,49 @@ fn write_verified(path: &Path, input_data: &[u8], result: &PackResult) -> Result
         bail!("{}: {e}", path.display());
     }
     Ok(manifest)
+}
+
+#[derive(Serialize)]
+struct FieldsReport<'a> {
+    candidates: &'a [FieldCandidate],
+    added: &'a [FieldCandidate],
+}
+
+fn cmd_fields(file: &Path, manifest_path: &Path, opts: &DetectOptions, apply: bool, json: bool) -> Result<()> {
+    let data = input::open(file)?;
+    let mut manifest = Manifest::load(manifest_path)?;
+    manifest.source.check(&data)?;
+    let candidates = detect_fields(&data, &manifest, opts);
+    let added = if apply { apply_unambiguous(&mut manifest, &candidates) } else { Vec::new() };
+    if apply {
+        check_fields(&data, &manifest)?;
+        manifest.save(manifest_path)?;
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&FieldsReport { candidates: &candidates, added: &added })?);
+        return Ok(());
+    }
+    println!("{:>6}  {:<17}  {:>10}  {:>5}  {:<6}  where", "stream", "holds", "at", "width", "order");
+    for c in &candidates {
+        let f = &c.field;
+        let status = if added.contains(c) { "added" } else if apply { "ambiguous, not added" } else { "" };
+        println!(
+            "{:>6}  {:<17}  {:#010x}  {:>5}  {:<6}  {:<5}  {status}",
+            c.stream_id,
+            format!("{:?}", f.measures).to_lowercase(),
+            f.offset,
+            f.width,
+            format!("{:?}", f.endian).to_lowercase(),
+            if c.near { "near" } else { "table" }
+        );
+    }
+    println!("{} candidate(s)", candidates.len());
+    if apply {
+        println!("{} field(s) added to {}", added.len(), manifest_path.display());
+    } else if !candidates.is_empty() {
+        println!("run with --apply to add the unambiguous ones to the manifest");
+    }
+    Ok(())
 }
 
 fn parse_offset(s: &str) -> Result<u64, String> {

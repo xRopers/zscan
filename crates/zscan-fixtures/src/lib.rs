@@ -246,7 +246,7 @@ impl Builder {
 
 /// Every fixture found with the default formats. [`brotli_streams`] needs brotli enabled.
 pub fn all() -> Vec<Fixture> {
-    vec![zlib_basic(), gzip_basic(), deflate_raw(), mixed(), codecs(), noise()]
+    vec![zlib_basic(), gzip_basic(), deflate_raw(), mixed(), codecs(), archive(true), archive(false), noise()]
 }
 
 pub fn zstd_frame(payload: &[u8], level: i32, checksum: bool) -> Vec<u8> {
@@ -523,4 +523,102 @@ pub fn noise() -> Fixture {
     let mut b = Builder::new(99);
     b.random(1 << 20);
     b.finish("noise", "1 MiB of random bytes; nothing should be found")
+}
+
+/// A toy archive, for length-field tests. Layout (all offsets absolute):
+///
+/// ```text
+/// "ZARC"  flags:u8 (1 = local size prefix)  pad:3  count:u32le
+/// count x { offset:u32le  csize:u32le  dsize:u32le  kind:u8 (0 zlib, 1 zstd)  pad:3 }
+/// 80 KiB of random bytes, so offsets are large enough to be recognisable
+/// per entry: [csize:u32be if flags & 1]  stream  zeros to a 16-byte boundary + 64  random
+/// ```
+///
+/// [`read_archive`] reads it the way a real consumer would: through the directory.
+pub fn archive(local_prefix: bool) -> Fixture {
+    let mut rng = Rng::new(if local_prefix { 31 } else { 32 });
+    let payloads = [text(&mut rng, 70_000), records(&mut rng, 20_000), text(&mut rng, 5000)];
+    let kinds = [Kind::Zlib, Kind::Zstd, Kind::Zlib];
+    let table_len = 12 + 16 * payloads.len();
+
+    let mut body = rng.bytes(80 * 1024);
+    let mut entries = Vec::new();
+    for (payload, kind) in payloads.iter().zip(kinds) {
+        let encoded = match kind {
+            Kind::Zstd => zstd_frame(payload, 3, true),
+            _ => zlib(payload, 6),
+        };
+        if local_prefix {
+            body.extend((encoded.len() as u32).to_be_bytes());
+        }
+        let offset = table_len + body.len();
+        entries.push((offset, encoded.len(), payload.len(), kind));
+        body.extend(&encoded);
+        body.resize((table_len + body.len()).next_multiple_of(16) - table_len + 64, 0);
+        body.extend(rng.bytes(3000));
+    }
+
+    let mut data = b"ZARC".to_vec();
+    data.extend([u8::from(local_prefix), 0, 0, 0]);
+    data.extend((payloads.len() as u32).to_le_bytes());
+    for &(offset, csize, dsize, kind) in &entries {
+        data.extend((offset as u32).to_le_bytes());
+        data.extend((csize as u32).to_le_bytes());
+        data.extend((dsize as u32).to_le_bytes());
+        data.extend([u8::from(kind == Kind::Zstd), 0, 0, 0]);
+    }
+    data.extend(body);
+
+    let expected = entries
+        .iter()
+        .zip(payloads)
+        .map(|(&(offset, csize, _, kind), payload)| Expected {
+            offset,
+            kind,
+            compressed_size: csize,
+            payload,
+            name: None,
+            reproducible: true,
+        })
+        .collect();
+    let (name, description) = if local_prefix {
+        ("archive_prefixed", "toy archive: directory of offset/csize/dsize, and a size prefix before each stream")
+    } else {
+        ("archive", "toy archive: directory of offset/csize/dsize per stream")
+    };
+    Fixture { name, description, data, expected }
+}
+
+/// Read a [`archive`] through its directory, checking every size it records.
+pub fn read_archive(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    use std::io::Read;
+    let u32_at = |pos: usize, big: bool| -> Result<usize, String> {
+        let b: [u8; 4] = data.get(pos..pos + 4).ok_or(format!("read past end at {pos:#x}"))?.try_into().unwrap();
+        Ok((if big { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) }) as usize)
+    };
+    if !data.starts_with(b"ZARC") {
+        return Err("bad magic".into());
+    }
+    let prefixed = data[4] & 1 != 0;
+    let count = u32_at(8, false)?;
+    let mut out = Vec::new();
+    for i in 0..count {
+        let e = 12 + 16 * i;
+        let (offset, csize, dsize, kind) = (u32_at(e, false)?, u32_at(e + 4, false)?, u32_at(e + 8, false)?, data[e + 12]);
+        if prefixed && u32_at(offset - 4, true)? != csize {
+            return Err(format!("entry {i}: size prefix disagrees with the directory"));
+        }
+        let stream = data.get(offset..offset + csize).ok_or(format!("entry {i}: stream out of bounds"))?;
+        let mut payload = Vec::new();
+        let ok = match kind {
+            1 => zstd::stream::read::Decoder::new(stream).and_then(|mut d| d.read_to_end(&mut payload)),
+            _ => flate2::read::ZlibDecoder::new(stream).read_to_end(&mut payload),
+        };
+        ok.map_err(|e| format!("entry {i}: {e}"))?;
+        if payload.len() != dsize {
+            return Err(format!("entry {i}: decompressed {} bytes, directory says {dsize}", payload.len()));
+        }
+        out.push(payload);
+    }
+    Ok(out)
 }

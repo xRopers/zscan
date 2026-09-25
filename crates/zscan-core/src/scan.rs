@@ -230,18 +230,35 @@ fn resolve_verified(hits: Vec<FoundStream>) -> Vec<FoundStream> {
     found
 }
 
-/// Skip-past with lookahead for unverified formats. An unverified match can be a false
-/// positive that starts a little before a real stream, decodes its first bytes as garbage
-/// and stops inside it. If a match that starts inside this one runs past its end, the
-/// later match is the real stream.
+/// Of two overlapping unverified matches, `current` and a `later` one that starts inside
+/// it, whether the later one should replace it.
+///
+/// It should when `current` is a false positive that starts a little before a real
+/// stream, decodes its first bytes as garbage and stops inside it: `later` is the real
+/// stream and runs past `current`'s end.
+///
+/// It should not when both are real streams back to back: a decode starting in the tail
+/// of the first can resynchronise with the second and end where it ends (seen twice in
+/// 6,388 raw deflate streams on a dense archive, stage 5). The sign is that some match
+/// starting at or after `current`'s end ends exactly where `later` does; `follows(from,
+/// end)` asks whether there is one.
+fn later_match_wins(current: &FoundStream, later: &FoundStream, mut follows: impl FnMut(u64, u64) -> bool) -> bool {
+    later.end() > current.end() && !follows(current.end(), later.end())
+}
+
+/// Skip-past with lookahead for unverified formats; see [`later_match_wins`].
 fn resolve_unverified(hits: Vec<FoundStream>) -> Vec<FoundStream> {
     let mut found = Vec::new();
     let mut i = 0;
     while i < hits.len() {
         let mut best = i;
         let mut j = i + 1;
+        let follows = |from: u64, end: u64| {
+            let first = hits.partition_point(|h| h.offset < from);
+            hits[first..].iter().take_while(|h| h.offset < end).any(|h| h.end() == end)
+        };
         while j < hits.len() && hits[j].offset < hits[best].end() {
-            if hits[j].end() > hits[best].end() {
+            if later_match_wins(&hits[best], &hits[j], follows) {
                 best = j;
             }
             j += 1;
@@ -405,7 +422,13 @@ mod tests {
                 let mut p = best.offset as usize + 1;
                 while p < best.end() as usize {
                     if let Some(other) = try_at(data, p, end, codecs, opts, ctx) {
-                        if other.end() > best.end() {
+                        let mut follows_ctx = DecodeCtx::new(ctx.max_output());
+                        let follows = |from: u64, to: u64| {
+                            (from..to).any(|q| {
+                                try_at(data, q as usize, end, codecs, opts, &mut follows_ctx).is_some_and(|h| h.end() == to)
+                            })
+                        };
+                        if later_match_wins(&best, &other, follows) {
                             best = other;
                         }
                     }
@@ -443,6 +466,33 @@ mod tests {
             data.extend(f.data);
         }
         data
+    }
+
+    fn hit(offset: u64, len: u64) -> FoundStream {
+        FoundStream {
+            offset,
+            format: Format::Deflate,
+            compressed_size: len,
+            decompressed_size: len * 3,
+            crc32: 0,
+            exact_params: None,
+            original_name: None,
+        }
+    }
+
+    #[test]
+    fn overlap_resolution() {
+        let offsets = |hits: Vec<FoundStream>| resolve_unverified(hits).iter().map(|h| (h.offset, h.end())).collect::<Vec<_>>();
+        // A false positive 3 bytes before a real stream, ending inside it: the real one wins.
+        assert_eq!(offsets(vec![hit(100, 60), hit(103, 5000)]), [(103, 5103)]);
+        // Two real streams back to back, and a misaligned decode from the first one's
+        // tail into the second: both real streams are kept, whichever is bigger.
+        assert_eq!(offsets(vec![hit(0, 133_050), hit(133_031, 1136), hit(133_050, 1117)]), [(0, 133_050), (133_050, 134_167)]);
+        assert_eq!(offsets(vec![hit(0, 2339), hit(2326, 47_011), hit(2339, 46_998)]), [(0, 2339), (2339, 49_337)]);
+        // The same with padding between them.
+        assert_eq!(offsets(vec![hit(0, 2339), hit(2326, 47_031), hit(2359, 46_998)]), [(0, 2339), (2359, 49_357)]);
+        // Disjoint matches are all kept.
+        assert_eq!(offsets(vec![hit(0, 10), hit(10, 10), hit(30, 5)]), [(0, 10), (10, 20), (30, 35)]);
     }
 
     #[test]

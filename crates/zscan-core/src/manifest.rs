@@ -250,7 +250,7 @@ pub fn is_safe_filename(name: &str) -> bool {
         && !name.contains(['/', '\\', ':', '\0'])
 }
 
-mod hex_u32 {
+pub(crate) mod hex_u32 {
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S: Serializer>(value: &u32, s: S) -> Result<S::Ok, S::Error> {

@@ -114,11 +114,21 @@ pub fn find_params(data: &[u8], body: &[u8], window_hint: Option<u8>) -> Option<
     const LEVELS: [u8; 9] = [6, 9, 1, 5, 4, 7, 8, 2, 3];
     const ALL_WINDOWS: [u8; 7] = [15, 14, 13, 12, 11, 10, 9];
 
-    let hinted = window_hint.filter(|w| (9..=15).contains(w)).map(|w| [w]);
-    let windows: &[u8] = hinted.as_ref().map_or(&ALL_WINDOWS, |w| w);
+    let mem_levels: Vec<u8> = match mem_level_hint(body) {
+        MemLevelHint::Exactly(m) => vec![m],
+        MemLevelHint::AtLeast(min) => MEM_LEVELS.into_iter().filter(|&m| m >= min).collect(),
+        MemLevelHint::NotZlib => return None,
+        MemLevelHint::Unknown => MEM_LEVELS.to_vec(),
+    };
+    let windows: Vec<u8> = match window_hint.filter(|w| (9..=15).contains(w)) {
+        Some(w) => vec![w],
+        // A window at least as big as the input (plus zlib's lookahead margin) never
+        // limits a match, so it gives the same output as 15, which is tried first.
+        None => ALL_WINDOWS.into_iter().filter(|&w| w == 15 || (1usize << w) - 262 < data.len()).collect(),
+    };
 
-    for &mem_level in &MEM_LEVELS {
-        for &window_bits in windows {
+    for &mem_level in &mem_levels {
+        for &window_bits in &windows {
             let mut candidates = Vec::with_capacity(27);
             for &level in &LEVELS {
                 candidates.push((level, Strategy::Default));
@@ -142,6 +152,158 @@ pub fn find_params(data: &[u8], body: &[u8], window_hint: Option<u8>) -> Option<
         }
     }
     None
+}
+
+/// What the first block of a raw deflate stream says about zlib's memLevel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemLevelHint {
+    Exactly(u8),
+    AtLeast(u8),
+    /// No zlib setting produces this block structure.
+    NotZlib,
+    /// Stored first block, or unparsable: no information.
+    Unknown,
+}
+
+/// zlib ends a block when its symbol buffer fills, after exactly 2^(memLevel+6) - 1
+/// literals and matches (all strategies except stored). A first block that isn't the
+/// last therefore pins memLevel, and one of any other length proves the stream wasn't
+/// made by zlib, which saves a stream like that the whole parameter search. A final
+/// first block only shows the buffer was bigger than its length.
+fn mem_level_hint(body: &[u8]) -> MemLevelHint {
+    let Some(block) = first_block(body) else { return MemLevelHint::Unknown };
+    if block.stored {
+        return MemLevelHint::Unknown;
+    }
+    let capacity = |m: u8| (1u32 << (m + 6)) - 1;
+    if block.last {
+        (1..=9).find(|&m| capacity(m) > block.symbols).map_or(MemLevelHint::NotZlib, MemLevelHint::AtLeast)
+    } else {
+        (1..=9).find(|&m| capacity(m) == block.symbols).map_or(MemLevelHint::NotZlib, MemLevelHint::Exactly)
+    }
+}
+
+struct FirstBlock {
+    last: bool,
+    stored: bool,
+    /// Literals plus matches, not counting end-of-block.
+    symbols: u32,
+}
+
+/// Parse the first deflate block just far enough to count its symbols.
+fn first_block(body: &[u8]) -> Option<FirstBlock> {
+    let mut bits = BitReader { data: body, pos: 0 };
+    let last = bits.read(1)? == 1;
+    let (litlen, dist) = match bits.read(2)? {
+        0 => return Some(FirstBlock { last, stored: true, symbols: 0 }),
+        1 => {
+            let mut lengths = [8u8; 288];
+            lengths[144..256].fill(9);
+            lengths[256..280].fill(7);
+            (Huffman::new(&lengths)?, Huffman::new(&[5; 30])?)
+        }
+        2 => {
+            const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+            let hlit = bits.read(5)? as usize + 257;
+            let hdist = bits.read(5)? as usize + 1;
+            let hclen = bits.read(4)? as usize + 4;
+            let mut cl_lengths = [0u8; 19];
+            for &i in &ORDER[..hclen] {
+                cl_lengths[i] = bits.read(3)? as u8;
+            }
+            let cl = Huffman::new(&cl_lengths)?;
+            let mut lengths = vec![0u8; hlit + hdist];
+            let mut i = 0;
+            while i < lengths.len() {
+                let (value, repeat) = match cl.decode(&mut bits)? {
+                    sym @ 0..=15 => (sym as u8, 1),
+                    16 => (*lengths.get(i.checked_sub(1)?)?, 3 + bits.read(2)? as usize),
+                    17 => (0, 3 + bits.read(3)? as usize),
+                    _ => (0, 11 + bits.read(7)? as usize),
+                };
+                lengths.get_mut(i..i + repeat)?.fill(value);
+                i += repeat;
+            }
+            (Huffman::new(&lengths[..hlit])?, Huffman::new(&lengths[hlit..])?)
+        }
+        _ => return None,
+    };
+    const LEN_EXTRA: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    const DIST_EXTRA: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+    let mut symbols = 0u32;
+    loop {
+        match litlen.decode(&mut bits)? {
+            0..=255 => {}
+            256 => return Some(FirstBlock { last, stored: false, symbols }),
+            sym => {
+                bits.read(*LEN_EXTRA.get(usize::from(sym) - 257)?)?;
+                let dist_sym = usize::from(dist.decode(&mut bits)?);
+                bits.read(*DIST_EXTRA.get(dist_sym)?)?;
+            }
+        }
+        symbols += 1;
+    }
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl BitReader<'_> {
+    /// Read `n` bits (at most 16), least significant first.
+    fn read(&mut self, n: u8) -> Option<u32> {
+        let mut v = 0;
+        for i in 0..n {
+            let byte = *self.data.get(self.pos >> 3)?;
+            v |= u32::from((byte >> (self.pos & 7)) & 1) << i;
+            self.pos += 1;
+        }
+        Some(v)
+    }
+}
+
+/// Canonical Huffman decoding, one bit at a time (as in zlib's puff.c).
+struct Huffman {
+    count: [u16; 16],
+    symbols: Vec<u16>,
+}
+
+impl Huffman {
+    fn new(lengths: &[u8]) -> Option<Self> {
+        let mut count = [0u16; 16];
+        for &l in lengths {
+            count[usize::from(l)] += 1;
+        }
+        count[0] = 0;
+        let mut offsets = [0u16; 16];
+        for len in 1..15 {
+            offsets[len + 1] = offsets[len] + count[len];
+        }
+        let mut symbols = vec![0u16; lengths.len()];
+        for (sym, &l) in lengths.iter().enumerate() {
+            if l != 0 {
+                symbols[usize::from(offsets[usize::from(l)])] = sym as u16;
+                offsets[usize::from(l)] += 1;
+            }
+        }
+        Some(Self { count, symbols })
+    }
+
+    fn decode(&self, bits: &mut BitReader) -> Option<u16> {
+        let (mut code, mut first, mut index) = (0i32, 0i32, 0i32);
+        for len in 1..16 {
+            code |= bits.read(1)? as i32;
+            let count = i32::from(self.count[len]);
+            if code - count < first {
+                return self.symbols.get((index + code - first) as usize).copied();
+            }
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        None
+    }
 }
 
 struct Deflater {
@@ -282,6 +444,27 @@ mod tests {
                 assert_eq!(d.compressed_size, body.len());
             }
         }
+    }
+
+    #[test]
+    fn first_block_reveals_mem_level() {
+        let data = sample(); // 1 MB: many blocks at every memLevel
+        for mem_level in [1, 5, 8, 9] {
+            for strategy in [Strategy::Default, Strategy::Fixed, Strategy::HuffmanOnly] {
+                let p = DeflateParams { level: 6, window_bits: 15, mem_level, strategy };
+                let hint = mem_level_hint(&compress_raw(&data, &p));
+                assert_eq!(hint, MemLevelHint::Exactly(mem_level), "{p}");
+            }
+        }
+        // One block: only a lower bound.
+        let small = &data[..2000];
+        let hint = mem_level_hint(&compress_raw(small, &DeflateParams::zlib_default(15)));
+        assert!(matches!(hint, MemLevelHint::AtLeast(m) if m <= 8), "{hint:?}");
+        // Level 0 is all stored blocks: no information.
+        let stored = DeflateParams { level: 0, ..DeflateParams::zlib_default(15) };
+        assert_eq!(mem_level_hint(&compress_raw(&data, &stored)), MemLevelHint::Unknown);
+        // miniz ends blocks at other lengths.
+        assert_eq!(mem_level_hint(&miniz_oxide::deflate::compress_to_vec(&data, 6)), MemLevelHint::NotZlib);
     }
 
     #[test]

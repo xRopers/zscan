@@ -8,7 +8,7 @@ use zscan_core::entropy::{entropy_map, shannon};
 use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_MIN_SIZE, DEFAULT_RAW_MAX_ENTROPY, DEFAULT_RAW_MIN_COMPRESSED, DEFAULT_RAW_MIN_RATIO};
 use zscan_core::{
     DetectOptions, ExtractOptions, FieldCandidate, FieldUpdate, Format, Manifest, Outcome, PackOptions, PackResult,
-    ScanOptions, apply_unambiguous, check_fields, detect_fields, ScanStats, SourceInfo, StreamEntry,
+    RebuildSummary, ScanOptions, apply_unambiguous, check_fields, detect_fields, rebuild, unpack, ScanStats, SourceInfo, StreamEntry,
     StreamPlan, decode_at, extract_all, input, load_edits, pack, scan, scan_with_stats,
 };
 
@@ -108,6 +108,28 @@ enum Command {
         /// Add unambiguous candidates to the manifest
         #[arg(long)]
         apply: bool,
+    },
+    /// Expand a file into its streams' decompressed contents plus everything needed to
+    /// recreate it bit for bit (to store or compress it better); undo with `rebuild`
+    Unpack {
+        file: PathBuf,
+        /// Directory to create (must not exist or be empty)
+        #[arg(short = 'd', long = "dir", value_name = "DIR")]
+        dir: PathBuf,
+        /// Manifest from `zscan scan -o` (otherwise the file is scanned first)
+        #[arg(short, long)]
+        manifest: Option<PathBuf>,
+        /// Filters for the scan (ignored with --manifest)
+        #[command(flatten)]
+        filters: ScanArgs,
+    },
+    /// Recreate the original file, bit for bit, from an `unpack` directory
+    Rebuild {
+        /// Directory written by `zscan unpack`
+        dir: PathBuf,
+        /// File to write
+        #[arg(short, long)]
+        output: PathBuf,
     },
     /// Try decoding one format at an exact offset, and optionally add the stream to a
     /// manifest. For formats that can't be scanned for (brotli), or to check a location
@@ -212,6 +234,8 @@ fn run(cli: Cli) -> Result<()> {
             let opts = PackOptions { verify_source: !force, use_zero_slack: use_slack, relocate, align };
             cmd_pack(&file, &manifest, &dir, &output, manifest_out.as_deref(), dry_run, &opts, cli.json)
         }
+        Command::Unpack { file, dir, manifest, filters } => cmd_unpack(&file, &dir, manifest.as_deref(), &filters, cli.json),
+        Command::Rebuild { dir, output } => cmd_rebuild(&dir, &output, cli.json),
         Command::Fields { file, manifest, window, min_value, apply } => {
             cmd_fields(&file, &manifest, &DetectOptions { window, min_global_value: min_value }, apply, cli.json)
         }
@@ -540,6 +564,64 @@ fn write_verified(path: &Path, input_data: &[u8], result: &PackResult) -> Result
         bail!("{}: {e}", path.display());
     }
     Ok(manifest)
+}
+
+fn cmd_unpack(file: &Path, dir: &Path, manifest: Option<&Path>, filters: &ScanArgs, json: bool) -> Result<()> {
+    let data = input::open(file)?;
+    let manifest = match manifest {
+        Some(path) => Manifest::load(path)?,
+        None => build_manifest(file, &data, filters.options()),
+    };
+    let summary = unpack(&data, &manifest, dir)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "unpacked {} stream(s) to {}: {} by encoder settings, {} by preflate, {} stored as is",
+            summary.streams,
+            dir.display(),
+            summary.encoded,
+            summary.preflated,
+            summary.stored
+        );
+        println!(
+            "{} bytes outside streams, {} bytes of contents, {} bytes of reconstruction data",
+            summary.gap_bytes, summary.content_bytes, summary.recon_bytes
+        );
+    }
+    Ok(())
+}
+
+fn cmd_rebuild(dir: &Path, output: &Path, json: bool) -> Result<()> {
+    let mut tmp = output.as_os_str().to_owned();
+    tmp.push(".zscan-tmp");
+    let tmp = PathBuf::from(tmp);
+    let outcome = (|| -> Result<RebuildSummary> {
+        let file = std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+        Ok(rebuild(dir, std::io::BufWriter::with_capacity(8 << 20, file))?)
+    })();
+    let summary = match outcome {
+        Ok(summary) => summary,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if let Err(e) = std::fs::rename(&tmp, output) {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("{}: {e}", output.display());
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "rebuilt {} ({} bytes, {} streams); size and CRC-32 match the original",
+            output.display(),
+            summary.bytes,
+            summary.streams
+        );
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]

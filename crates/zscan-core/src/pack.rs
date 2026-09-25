@@ -437,10 +437,10 @@ fn sorted_streams(manifest: &Manifest, len: usize) -> Result<Vec<&StreamEntry>> 
             return Err(Error::InvalidManifest(format!("streams {} and {} overlap", pair[0].id, pair[1].id)));
         }
     }
-    if let Some(last) = streams.last() {
-        if last.end() > len as u64 {
-            return Err(Error::InvalidManifest(format!("stream {} runs past the end of the input", last.id)));
-        }
+    if let Some(last) = streams.last()
+        && last.end() > len as u64
+    {
+        return Err(Error::InvalidManifest(format!("stream {} runs past the end of the input", last.id)));
     }
     Ok(streams)
 }

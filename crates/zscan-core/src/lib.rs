@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod pack;
 pub mod params;
 pub mod scan;
+pub mod unpack;
 
 pub use codec::{Codec, DecodeCtx, DecodeError, Decoded, Format, codec_for};
 pub use params::{DeflateParams, EncoderParams, Strategy};
@@ -27,4 +28,5 @@ pub use manifest::{Manifest, SourceInfo, StreamEntry};
 pub use fields::{DetectOptions, FieldCandidate, apply_unambiguous, check_fields, detect_fields};
 pub use manifest::{Endian, LengthField, Measures};
 pub use pack::{FieldUpdate, Outcome, PackOptions, PackResult, StreamPlan, load_edits, pack};
+pub use unpack::{Method, RebuildSummary, UnpackIndex, UnpackSummary, rebuild, unpack};
 pub use scan::{FoundStream, ScanOptions, ScanStats, decode_at, scan, scan_with_stats};

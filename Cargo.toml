@@ -13,7 +13,8 @@ zscan-fixtures = { path = "crates/zscan-fixtures" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1.4"
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+libz-sys = { version = "1.1", default-features = false, features = ["static"] }
 memmap2 = "0.9"
 miniz_oxide = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -23,4 +24,9 @@ thiserror = "2"
 
 # The raw-deflate pass inflates at almost every offset; keep the inflater fast in debug/test builds.
 [profile.dev.package.miniz_oxide]
+opt-level = 3
+
+# Parameter matching recompresses every found stream many times; bundled zlib is built by cc,
+# which follows this setting.
+[profile.dev.package.libz-sys]
 opt-level = 3

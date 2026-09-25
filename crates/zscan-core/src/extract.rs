@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::checksum::crc32;
-use crate::codec::{DecodeCtx, codec_for};
+use crate::codec::{DecodeCtx, Decoded, codec_for};
 use crate::error::{Error, Result, io_err};
 use crate::manifest::{Manifest, StreamEntry, is_safe_filename};
 
@@ -32,7 +32,7 @@ pub struct ExtractedFile {
 
 /// Decode one manifest stream from `data` and check it against the manifest's
 /// sizes and checksum.
-pub fn decode_stream(data: &[u8], entry: &StreamEntry, ctx: &mut DecodeCtx) -> Result<Vec<u8>> {
+pub fn decode_stream(data: &[u8], entry: &StreamEntry, ctx: &mut DecodeCtx) -> Result<Decoded> {
     let fail = |reason: String| Error::Stream { id: entry.id, offset: entry.offset, reason };
     let start = usize::try_from(entry.offset)
         .ok()
@@ -58,7 +58,7 @@ pub fn decode_stream(data: &[u8], entry: &StreamEntry, ctx: &mut DecodeCtx) -> R
     if actual != entry.crc32 {
         return Err(fail(format!("CRC-32 is {actual:08x}, manifest says {:08x}", entry.crc32)));
     }
-    Ok(decoded.data)
+    Ok(decoded)
 }
 
 /// Write every stream in `manifest` to `out_dir`, verifying each one on the way.
@@ -81,7 +81,7 @@ pub fn extract_all(
     let mut ctx = DecodeCtx::new(usize::try_from(largest).unwrap_or(usize::MAX));
     let mut written = Vec::with_capacity(manifest.streams.len());
     for entry in &manifest.streams {
-        let bytes = decode_stream(data, entry, &mut ctx)?;
+        let bytes = decode_stream(data, entry, &mut ctx)?.data;
         let path = out_dir.join(&entry.file);
         fs::write(&path, &bytes).map_err(io_err(&path))?;
         written.push(ExtractedFile { id: entry.id, offset: entry.offset, path, size: bytes.len() as u64 });

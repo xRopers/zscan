@@ -18,6 +18,12 @@ pub enum Error {
     #[error("stream {id} at offset {offset:#x}: {reason}")]
     Stream { id: u32, offset: u64, reason: String },
 
+    #[error("invalid manifest: {0}")]
+    InvalidManifest(String),
+
+    #[error("verification failed for stream {id} at offset {offset:#x}: {reason}")]
+    Verify { id: u32, offset: u64, reason: String },
+
     #[error("manifest names an unsafe output file {0:?} (must be a plain file name)")]
     BadFilename(String),
 }

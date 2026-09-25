@@ -8,7 +8,8 @@
       "decompressed_size": 4000,
       "format": "zlib",
       "offset": 512,
-      "original_name": null
+      "original_name": null,
+      "zlib_made": true
     },
     {
       "compressed_size": 1005,
@@ -16,7 +17,8 @@
       "decompressed_size": 4000,
       "format": "gzip",
       "offset": 1628,
-      "original_name": "inner.txt"
+      "original_name": "inner.txt",
+      "zlib_made": true
     },
     {
       "compressed_size": 1472,
@@ -24,7 +26,8 @@
       "decompressed_size": 5000,
       "format": "deflate",
       "offset": 2733,
-      "original_name": null
+      "original_name": null,
+      "zlib_made": true
     },
     {
       "compressed_size": 780,
@@ -32,7 +35,8 @@
       "decompressed_size": 3000,
       "format": "deflate",
       "offset": 4819,
-      "original_name": null
+      "original_name": null,
+      "zlib_made": true
     }
   ]
 }

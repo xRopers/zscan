@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::checksum::crc32;
 use crate::codec::{Codec, CompressionParams, DecodeCtx, Format, codec_for};
+use crate::deflater::find_params;
 use crate::entropy::shannon;
 
 pub const DEFAULT_MIN_SIZE: u64 = 32;
@@ -46,6 +47,13 @@ pub struct ScanOptions {
     pub max_entropy: Option<f64>,
     /// Largest decompressed size of any single stream.
     pub max_output: u64,
+    /// Search for zlib settings that reproduce each stream exactly (see [`find_params`]).
+    #[serde(default = "yes")]
+    pub match_params: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for ScanOptions {
@@ -58,6 +66,7 @@ impl Default for ScanOptions {
             min_ratio: 0.0,
             max_entropy: None,
             max_output: DEFAULT_MAX_OUTPUT,
+            match_params: true,
         }
     }
 }
@@ -141,9 +150,23 @@ fn scan_range(
                 p += 1;
             }
         }
+        if opts.match_params {
+            match_params(data, &mut best, ctx);
+        }
         pos = best.end() as usize;
         found.push(best);
     }
+}
+
+/// Replace the header-derived params with exact ones if some zlib setting reproduces the stream.
+fn match_params(data: &[u8], found: &mut FoundStream, ctx: &mut DecodeCtx) {
+    let start = found.offset as usize;
+    let stream = &data[start..start + found.compressed_size as usize];
+    let Ok(decoded) = codec_for(found.format).decode(stream, ctx) else { return };
+    if let Some(p) = find_params(&decoded.data, &stream[decoded.body.clone()], found.params.window_bits) {
+        found.params = CompressionParams::exact(p);
+    }
+    ctx.recycle(decoded.data);
 }
 
 /// The first codec whose stream at `pos` decodes and passes the filters.

@@ -1,6 +1,7 @@
 //! The [`Codec`] trait and the types shared by every stream format.
 
 use std::fmt;
+use std::ops::Range;
 use std::str::FromStr;
 
 use miniz_oxide::inflate::TINFLStatus;
@@ -8,6 +9,7 @@ use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 use serde::{Deserialize, Serialize};
 
 use crate::codecs::{DeflateCodec, GzipCodec, ZlibCodec};
+use crate::deflater::DeflateParams;
 
 /// Compressed stream formats. Declaration order is scan priority: when two formats
 /// match at the same offset, the earlier (better verified) one wins.
@@ -81,11 +83,36 @@ pub struct CompressionParams {
     pub exact_match: bool,
 }
 
+impl CompressionParams {
+    /// Params known to reproduce the original stream exactly.
+    pub fn exact(p: DeflateParams) -> Self {
+        Self {
+            level: Some(p.level),
+            window_bits: Some(p.window_bits),
+            mem_level: Some(p.mem_level),
+            strategy: Some(p.strategy),
+            exact_match: true,
+        }
+    }
+
+    /// The complete settings, if every field is known.
+    pub fn deflate_params(&self) -> Option<DeflateParams> {
+        Some(DeflateParams {
+            level: self.level?,
+            window_bits: self.window_bits?,
+            mem_level: self.mem_level?,
+            strategy: self.strategy?,
+        })
+    }
+}
+
 /// A successfully decoded stream.
 #[derive(Debug, Clone)]
 pub struct Decoded {
     /// Bytes the whole stream occupies in the input, including header and trailer.
     pub compressed_size: usize,
+    /// Where the raw deflate body sits within the stream. Everything before it is header.
+    pub body: Range<usize>,
     pub data: Vec<u8>,
     pub params: CompressionParams,
     /// File name stored in the stream header (gzip FNAME), if any.
@@ -120,6 +147,11 @@ pub trait Codec: Send + Sync {
 
     /// Decode a stream that starts at `data[0]`. `data` may extend past the stream end.
     fn decode(&self, data: &[u8], ctx: &mut DecodeCtx) -> Result<Decoded, DecodeError>;
+
+    /// Build a complete stream from `header` (the original stream's bytes before its
+    /// body, reused as-is), a new raw deflate `body`, and the uncompressed `data` it
+    /// encodes (for the trailer).
+    fn wrap(&self, header: &[u8], body: &[u8], data: &[u8]) -> Vec<u8>;
 }
 
 /// The codec implementation for a format.

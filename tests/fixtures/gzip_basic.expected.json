@@ -8,7 +8,8 @@
       "decompressed_size": 6000,
       "format": "gzip",
       "offset": 300,
-      "original_name": "hello.txt"
+      "original_name": "hello.txt",
+      "zlib_made": true
     },
     {
       "compressed_size": 1217,
@@ -16,7 +17,8 @@
       "decompressed_size": 4000,
       "format": "gzip",
       "offset": 2986,
-      "original_name": null
+      "original_name": null,
+      "zlib_made": true
     },
     {
       "compressed_size": 863,
@@ -24,7 +26,8 @@
       "decompressed_size": 3000,
       "format": "gzip",
       "offset": 4267,
-      "original_name": "all_fields.bin"
+      "original_name": "all_fields.bin",
+      "zlib_made": true
     },
     {
       "compressed_size": 465,
@@ -32,7 +35,8 @@
       "decompressed_size": 1500,
       "format": "gzip",
       "offset": 5130,
-      "original_name": null
+      "original_name": null,
+      "zlib_made": true
     }
   ]
 }

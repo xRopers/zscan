@@ -45,10 +45,19 @@ impl Codec for ZlibCodec {
         }
         Ok(Decoded {
             compressed_size: end + TRAILER_LEN,
+            body: HEADER_LEN..end,
             data: ctx.take_output(len),
             params: CompressionParams { window_bits: Some(window_bits), ..Default::default() },
             original_name: None,
         })
+    }
+
+    fn wrap(&self, header: &[u8], body: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(header.len() + body.len() + TRAILER_LEN);
+        out.extend_from_slice(header);
+        out.extend_from_slice(body);
+        out.extend_from_slice(&adler32(data).to_be_bytes());
+        out
     }
 }
 

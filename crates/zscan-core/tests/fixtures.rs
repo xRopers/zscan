@@ -2,8 +2,10 @@
 
 use std::path::Path;
 
+use zscan_core::deflater::compress_raw;
 use zscan_core::{
-    DecodeCtx, Error, ExtractOptions, Format, Manifest, ScanOptions, SourceInfo, decode_stream, extract_all, scan,
+    DecodeCtx, Error, ExtractOptions, Format, Manifest, ScanOptions, SourceInfo, codec_for, decode_stream, extract_all,
+    scan,
 };
 use zscan_fixtures::{Fixture, Kind};
 
@@ -39,6 +41,30 @@ fn every_fixture_scans_exactly() {
 }
 
 #[test]
+fn matched_params_rebuild_zlib_made_streams_exactly() {
+    let mut ctx = DecodeCtx::new(1 << 24);
+    for f in zscan_fixtures::all() {
+        for (s, e) in scan(&f.data, &ScanOptions::default()).iter().zip(&f.expected) {
+            let what = format!("fixture {} stream at {:#x}", f.name, e.offset);
+            assert_eq!(s.params.exact_match, e.zlib_made, "{what}");
+            let Some(params) = s.params.deflate_params().filter(|_| s.params.exact_match) else { continue };
+            let original = &f.data[e.offset..e.offset + e.compressed_size];
+            let codec = codec_for(s.format);
+            let header = &original[..codec.decode(original, &mut ctx).unwrap().body.start];
+            let rebuilt = codec.wrap(header, &compress_raw(&e.payload, &params), &e.payload);
+            assert!(rebuilt == original, "{what}: {params} does not rebuild it");
+        }
+    }
+}
+
+#[test]
+fn matching_can_be_turned_off() {
+    let f = zscan_fixtures::zlib_basic();
+    let opts = ScanOptions { match_params: false, ..Default::default() };
+    assert!(scan(&f.data, &opts).iter().all(|s| !s.params.exact_match && s.params.level.is_none()));
+}
+
+#[test]
 fn gzip_names_and_zlib_window_bits_are_recorded() {
     let f = zscan_fixtures::gzip_basic();
     let names: Vec<_> = scan(&f.data, &ScanOptions::default()).into_iter().map(|s| s.original_name).collect();
@@ -47,7 +73,7 @@ fn gzip_names_and_zlib_window_bits_are_recorded() {
 
     let f = zscan_fixtures::zlib_basic();
     let bits: Vec<_> = scan(&f.data, &ScanOptions::default()).into_iter().map(|s| s.params.window_bits).collect();
-    assert_eq!(bits, [Some(15), Some(15), Some(15), Some(15), Some(12)]);
+    assert_eq!(bits, [Some(15), Some(15), Some(15), Some(15), Some(12), Some(15)]);
 }
 
 #[test]
@@ -67,7 +93,7 @@ fn size_ratio_and_entropy_filters() {
     assert_eq!(scan(&f.data, &opts).len(), f.expected.len() - 1);
 
     let opts = ScanOptions { min_size: 3001, ..Default::default() };
-    assert_eq!(scan(&f.data, &opts).len(), 2, "only the 5000 and 20000 byte payloads remain");
+    assert_eq!(scan(&f.data, &opts).len(), 3, "only the 4000, 5000 and 20000 byte payloads remain");
 
     // Text payloads are ~4 bits/byte; records are lower.
     let opts = ScanOptions { max_entropy: Some(1.0), ..Default::default() };

@@ -189,8 +189,7 @@ impl DecodeCtx {
         self.inflater.init();
         let floor = INITIAL_OUTPUT.min(self.max_output);
         if self.buf.len() < floor {
-            let len = self.buf.capacity().clamp(floor, self.max_output);
-            self.buf.resize(len, 0);
+            self.buf.resize(floor, 0);
         }
         // The whole remaining input is available up front, so running out of input
         // means the stream is truncated.
@@ -222,18 +221,10 @@ impl DecodeCtx {
         &self.buf[..len]
     }
 
-    /// Move the first `len` output bytes out of the context.
+    /// Copy the first `len` output bytes out of the context. Copying (rather than moving
+    /// the buffer out) keeps the buffer initialised at full length, so later attempts
+    /// never re-zero it. Scanning makes thousands of small decodes per MiB.
     pub(crate) fn take_output(&mut self, len: usize) -> Vec<u8> {
-        let mut out = std::mem::take(&mut self.buf);
-        out.truncate(len);
-        out
-    }
-
-    /// Hand a buffer back (e.g. `Decoded::data` once finished with it) to avoid reallocating.
-    pub fn recycle(&mut self, mut buf: Vec<u8>) {
-        if buf.capacity() > self.buf.capacity() {
-            buf.clear();
-            self.buf = buf;
-        }
+        self.buf[..len].to_vec()
     }
 }

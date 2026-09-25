@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::checksum::crc32;
@@ -62,6 +63,7 @@ pub fn decode_stream(data: &[u8], entry: &StreamEntry, ctx: &mut DecodeCtx) -> R
 }
 
 /// Write every stream in `manifest` to `out_dir`, verifying each one on the way.
+/// Streams are decoded in parallel; the result is in manifest order.
 pub fn extract_all(
     data: &[u8],
     manifest: &Manifest,
@@ -78,14 +80,18 @@ pub fn extract_all(
     fs::create_dir_all(out_dir).map_err(io_err(out_dir))?;
 
     let largest = manifest.streams.iter().map(|s| s.decompressed_size).max().unwrap_or(0);
-    let mut ctx = DecodeCtx::new(usize::try_from(largest).unwrap_or(usize::MAX));
-    let mut written = Vec::with_capacity(manifest.streams.len());
-    for entry in &manifest.streams {
-        let bytes = decode_stream(data, entry, &mut ctx)?.data;
-        let path = out_dir.join(&entry.file);
-        fs::write(&path, &bytes).map_err(io_err(&path))?;
-        written.push(ExtractedFile { id: entry.id, offset: entry.offset, path, size: bytes.len() as u64 });
-        ctx.recycle(bytes);
-    }
-    Ok(written)
+    let max_output = usize::try_from(largest).unwrap_or(usize::MAX);
+    manifest
+        .streams
+        .par_iter()
+        .map_init(
+            || DecodeCtx::new(max_output),
+            |ctx, entry| {
+                let bytes = decode_stream(data, entry, ctx)?.data;
+                let path = out_dir.join(&entry.file);
+                fs::write(&path, &bytes).map_err(io_err(&path))?;
+                Ok(ExtractedFile { id: entry.id, offset: entry.offset, path, size: bytes.len() as u64 })
+            },
+        )
+        .collect()
 }

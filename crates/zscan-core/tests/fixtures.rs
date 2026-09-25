@@ -121,8 +121,20 @@ fn raw_deflate_filters() {
     assert!(scan(&data, &ScanOptions::default()).is_empty());
 
     let offsets = |opts: ScanOptions| scan(&data, &opts).iter().map(|s| s.offset).collect::<Vec<_>>();
-    assert_eq!(offsets(ScanOptions { raw_max_entropy: None, ..Default::default() }), [offset]);
+    let stored_ok = ScanOptions { raw_max_entropy: None, raw_min_ratio: 0.0, ..Default::default() };
+    assert_eq!(offsets(stored_ok), [offset]);
+    // Either stored-content rule alone rejects it.
+    assert!(offsets(ScanOptions { raw_max_entropy: None, ..Default::default() }).is_empty());
+    assert!(offsets(ScanOptions { raw_min_ratio: 0.0, ..Default::default() }).is_empty());
     assert_eq!(offsets(ScanOptions { raw_min_compressed: 100, ..Default::default() }), [small_offset]);
+}
+
+#[test]
+fn stored_raw_deflate_needs_ratio_filter_off() {
+    let f = zscan_fixtures::deflate_raw();
+    let found = |opts: ScanOptions| scan(&f.data, &opts).len();
+    assert_eq!(found(ScanOptions::default()), f.expected.len());
+    assert_eq!(found(ScanOptions { raw_min_ratio: 0.0, ..Default::default() }), f.expected.len() + 1);
 }
 
 #[test]

@@ -16,8 +16,8 @@ fn manifest_for(data: &[u8]) -> Manifest {
 }
 
 fn pack_ok(data: &[u8], manifest: &Manifest, edits: &BTreeMap<u32, Vec<u8>>) -> (PackResult, Vec<u8>) {
-    let mut result = pack(data, manifest, edits, &PackOptions::default()).unwrap();
-    let out = result.data.take().expect("pack should fit");
+    let result = pack(data, manifest, edits, &PackOptions::default()).unwrap();
+    let out = result.apply(data).expect("pack should fit");
     (result, out)
 }
 
@@ -67,7 +67,7 @@ fn every_stream_edited_round_trips() {
         assert!(out[pos..] == f.data[pos..]);
 
         // The returned manifest describes the packed file: extracting gives the edits back.
-        let packed_manifest = result.manifest.unwrap();
+        let packed_manifest = result.verify_output(&out).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let files = extract_all(&out, &packed_manifest, dir.path(), &ExtractOptions::default()).unwrap();
         for file in files {
@@ -130,7 +130,7 @@ fn too_large_is_reported_with_the_overflow() {
     let mut rng = zscan_fixtures::Rng::new(5);
     let edits = BTreeMap::from([(1, shrink(&f.expected[1].payload)), (2, rng.bytes(20_000))]);
     let result = pack(&f.data, &manifest, &edits, &PackOptions::default()).unwrap();
-    assert!(result.data.is_none() && result.manifest.is_none());
+    assert!(!result.fits() && result.apply(&f.data).is_none());
     let failures: Vec<_> = result.failures().collect();
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].id, 2);
@@ -160,8 +160,8 @@ fn zero_slack_is_opt_in() {
     assert_eq!(strict.failures().count(), 1);
 
     let opts = PackOptions { use_zero_slack: true, ..Default::default() };
-    let mut result = pack(&f.data, &manifest, &edits, &opts).unwrap();
-    let out = result.data.take().unwrap();
+    let result = pack(&f.data, &manifest, &edits, &opts).unwrap();
+    let out = result.apply(&f.data).unwrap();
     let Outcome::Repacked { slack_used, new_size, .. } = result.streams[0].outcome else { panic!() };
     assert!(slack_used > 0 && slack_used <= 600);
     assert_eq!(new_size, manifest.streams[0].compressed_size + slack_used);
@@ -214,8 +214,32 @@ fn packing_twice_is_stable() {
     let manifest = manifest_for(&f.data);
     let edits = BTreeMap::from([(0, shrink(&f.expected[0].payload))]);
     let (first, out) = pack_ok(&f.data, &manifest, &edits);
-    let packed_manifest = first.manifest.unwrap();
+    let packed_manifest = first.verify_output(&out).unwrap();
     // Packing the same edit into the packed file changes nothing.
     let (_, again) = pack_ok(&out, &packed_manifest, &edits);
     assert!(again == out);
+}
+
+#[test]
+fn streamed_output_matches_apply_and_verify_catches_damage() {
+    let f = zscan_fixtures::gzip_basic();
+    let manifest = manifest_for(&f.data);
+    let edits = BTreeMap::from([(1, shrink(&f.expected[1].payload))]);
+    let (result, out) = pack_ok(&f.data, &manifest, &edits);
+
+    let mut streamed = Vec::new();
+    result.write_to(&f.data, &mut streamed).unwrap();
+    assert!(streamed == out);
+
+    let packed_manifest = result.verify_output(&out).unwrap();
+    assert_eq!(packed_manifest.source.size, out.len() as u64);
+    packed_manifest.source.check(&out).unwrap();
+
+    // Damage an unchanged stream and the edited one in turn: both are caught.
+    for id in [0usize, 1] {
+        let mut damaged = out.clone();
+        damaged[packed_manifest.streams[id].offset as usize + 20] ^= 0x40;
+        let err = result.verify_output(&damaged).unwrap_err();
+        assert!(matches!(err, Error::Verify { id: bad, .. } if bad as usize == id), "{err}");
+    }
 }

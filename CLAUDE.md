@@ -61,7 +61,13 @@ All commands support `--json` output for scripting.
 - Param matching compares only the deflate *body*. Pack reuses each stream's original header bytes (gzip name/mtime/flags, zlib FLEVEL) and recomputes the trailer. Level 0 is matched as a single `compress2`-style call, because stored block sizes depend on output buffering.
 - Pack copies unedited streams byte for byte. Edited streams try the matched params first, then level 9 × memLevel {9,8} × {default, filtered}, never with a window larger than the original header declares. Output is verified by decoding every stream before anything is written. Zero slack is opt-in (`--use-slack`); relocation and length fields are stage 5.
 - Scan runs two passes: gzip/zlib first, then raw deflate only in the gaps. A raw match that a later match starting inside it runs past is dropped as misaligned.
-- Raw deflate defaults (from 256 MiB of random data, 0 FPs): min 256 *compressed* bytes, output entropy ≤ 7.5. Speed is about 3 MB/s single-threaded because fixed-Huffman garbage decoding dominates. That's the stage 3 target.
+- Raw deflate defaults: min 256 *compressed* bytes, output entropy ≤ 7.5, ratio ≥ 1.1. The ratio rule came from 4 GiB of mixed data, where chance stored blocks such as `00 00 00 ff ff` showed up in structured data. As a result, level-0 raw deflate is skipped unless `--raw-min-ratio 0`. See the `ScanOptions` docs.
+- Stage 3 performance, on a Core Ultra 9 285K with 24 threads and a 4 GiB mixed file: scan 11 s (≈400 MiB/s), extract 2 s, pack including write and read-back verify 7.5 s. Private memory stays under 35 MiB for every command. The raw pass runs 30 MiB/s single-threaded.
+  - The fixed-Huffman static-table probe (`probe_fixed_block`) gave a 10× speedup. It must only reject what inflate rejects; unit tests enforce that.
+  - `DecodeCtx::take_output` copies, never moves: moving the buffer re-zeroed MBs after every garbage hit, which made scanning 60× slower.
+- Parallel scan (`scan_chunked`) collects every hit per chunk without skipping, then replays skip-past and lookahead sequentially. Results must be identical to the sequential oracle in `scan.rs` tests for any chunk size. Keep `try_at` a pure function of (offset, window end).
+- Pack returns patches, not a whole-file buffer. The CLI streams output to a temp file, mmaps it back, `verify_output` decodes every stream, then renames.
+- Benchmarks (files live in `E:\zscan-bench`, outside the repo): `gen-big <out> <MiB> [seed]` writes a mixed file plus expected list; `zscan scan <out> -o m.json --stats`; `check-scan m.json <out>.expected.json`.
 - Fixtures: `crates/zscan-fixtures` builds them deterministically; `cargo run -p zscan-fixtures --bin gen-fixtures` writes `tests/fixtures/*.bin` + `*.expected.json`.
 - cargo is at `%USERPROFILE%\.cargo\bin` and is not on the Git Bash PATH; use PowerShell. `cargo test --workspace`.
 

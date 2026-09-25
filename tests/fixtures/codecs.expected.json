@@ -1,0 +1,105 @@
+{
+  "description": "zstd, xz, bzip2 and lz4 streams in several configurations, plus traps for each format",
+  "size": 88940,
+  "streams": [
+    {
+      "compressed_size": 2171,
+      "crc32": "f51a3afb",
+      "decompressed_size": 9000,
+      "format": "zstd",
+      "offset": 700,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 4743,
+      "crc32": "05b6c1d1",
+      "decompressed_size": 20000,
+      "format": "zstd",
+      "offset": 3171,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 1230,
+      "crc32": "b50c3448",
+      "decompressed_size": 5000,
+      "format": "zstd",
+      "offset": 8214,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 1616,
+      "crc32": "4987fc5f",
+      "decompressed_size": 7000,
+      "format": "xz",
+      "offset": 9744,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 1328,
+      "crc32": "7e81ee62",
+      "decompressed_size": 6000,
+      "format": "xz",
+      "offset": 11660,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 1808,
+      "crc32": "c16f76d5",
+      "decompressed_size": 8000,
+      "format": "xz",
+      "offset": 13288,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 1712,
+      "crc32": "2ef77369",
+      "decompressed_size": 12000,
+      "format": "bzip2",
+      "offset": 15396,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 730,
+      "crc32": "b6e283ef",
+      "decompressed_size": 3000,
+      "format": "bzip2",
+      "offset": 17408,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 4277,
+      "crc32": "581e950d",
+      "decompressed_size": 10000,
+      "format": "lz4",
+      "offset": 18438,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 59656,
+      "crc32": "69ef30f4",
+      "decompressed_size": 150000,
+      "format": "lz4",
+      "offset": 23015,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 2019,
+      "crc32": "58cb69e6",
+      "decompressed_size": 2000,
+      "format": "lz4",
+      "offset": 82971,
+      "original_name": null,
+      "reproducible": false
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "description": "brotli streams (quality 11 and 5) in random filler; scan with brotli enabled",
+  "size": 8744,
+  "streams": [
+    {
+      "compressed_size": 3740,
+      "crc32": "da69239d",
+      "decompressed_size": 20000,
+      "format": "brotli",
+      "offset": 1000,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 2004,
+      "crc32": "def4d9ea",
+      "decompressed_size": 8000,
+      "format": "brotli",
+      "offset": 5740,
+      "original_name": null,
+      "reproducible": true
+    }
+  ]
+}

@@ -10,7 +10,17 @@ use std::ptr;
 use libz_sys as z;
 use serde::{Deserialize, Serialize};
 
-use crate::codec::Strategy;
+
+/// zlib compression strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    Default,
+    Filtered,
+    HuffmanOnly,
+    Rle,
+    Fixed,
+}
 
 /// Complete zlib deflate settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

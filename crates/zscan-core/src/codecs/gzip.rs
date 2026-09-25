@@ -2,7 +2,10 @@
 //! little-endian CRC-32 and ISIZE (size mod 2^32) trailer. Each member is its own stream.
 
 use crate::checksum::crc32;
-use crate::codec::{Codec, CompressionParams, DecodeCtx, DecodeError, Decoded, Format};
+use super::deflate::{adapt_family_params, family_params, find_family_params, stronger_family_params};
+use crate::codec::{Codec, DecodeCtx, DecodeError, Decoded, Format};
+use crate::deflater::{DeflateParams, compress_raw};
+use crate::params::EncoderParams;
 
 pub struct GzipCodec;
 
@@ -99,15 +102,34 @@ impl Codec for GzipCodec {
             compressed_size: end + TRAILER_LEN,
             body: header.len..end,
             data: ctx.take_output(len),
-            params: CompressionParams::default(),
             original_name: header.name,
         })
     }
 
-    fn wrap(&self, header: &[u8], body: &[u8], data: &[u8]) -> Vec<u8> {
+    fn find_params(&self, stream: &[u8], decoded: &Decoded) -> Option<EncoderParams> {
+        find_family_params(stream, decoded, None)
+    }
+
+    fn default_params(&self, _stream: &[u8], _decoded: &Decoded) -> EncoderParams {
+        EncoderParams::Deflate(DeflateParams::zlib_default(15))
+    }
+
+    fn adapt_params(&self, _stream: &[u8], _decoded: &Decoded, params: &EncoderParams) -> Result<EncoderParams, String> {
+        adapt_family_params(params, 15)
+    }
+
+    fn stronger_params(&self, base: &EncoderParams) -> Vec<EncoderParams> {
+        stronger_family_params(base)
+    }
+
+    /// Reuses the original header (name, mtime, flags, header CRC) and appends a fresh
+    /// CRC-32 and size.
+    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Vec<u8> {
+        let header = &stream[..decoded.body.start];
+        let body = compress_raw(data, family_params(params));
         let mut out = Vec::with_capacity(header.len() + body.len() + TRAILER_LEN);
         out.extend_from_slice(header);
-        out.extend_from_slice(body);
+        out.extend_from_slice(&body);
         out.extend_from_slice(&crc32(data).to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out

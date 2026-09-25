@@ -2,9 +2,10 @@
 //!
 //! For each stream in the manifest:
 //! - No edit: the original bytes are kept untouched.
-//! - Edited: the new data is compressed with the params matched at scan time (or zlib's
-//!   defaults), then with stronger settings if that doesn't fit the original slot. The
-//!   original header is reused, the trailer recomputed, and leftover space zero-filled.
+//! - Edited: the new data is encoded with the settings matched at scan time (or defaults
+//!   taken from the original header), then with stronger settings if that doesn't fit
+//!   the original slot. Header fields are reused where the format allows, and leftover
+//!   space is zero-filled.
 //!
 //! [`pack`] only plans: it returns the new stream bytes as patches, each already checked
 //! to decode to the edited data, so memory use scales with the edits rather than the
@@ -20,11 +21,11 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::checksum::crc32;
-use crate::codec::{Codec, CompressionParams, DecodeCtx, Decoded, Format, Strategy, codec_for};
-use crate::deflater::{DeflateParams, compress_raw};
+use crate::codec::{Codec, DecodeCtx, Decoded, Format, codec_for};
 use crate::error::{Error, Result, io_err};
 use crate::extract::decode_stream;
 use crate::manifest::{Manifest, StreamEntry, is_safe_filename};
+use crate::params::EncoderParams;
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
@@ -48,7 +49,7 @@ pub enum Outcome {
     Unchanged,
     Repacked {
         new_size: u64,
-        params: DeflateParams,
+        params: EncoderParams,
         /// True when the settings that reproduce the original stream were good enough.
         reused_original_params: bool,
         /// Bytes of trailing zero slack the new stream grew into.
@@ -259,13 +260,18 @@ fn plan_stream(
     let original = decode_stream(data, entry, ctx)?;
     let start = entry.offset as usize;
     let end = entry.end() as usize;
-    let header = &data[start..start + original.body.start];
+    let old_stream = &data[start..end];
     let slack = if opts.use_zero_slack { data[end..next_start].iter().take_while(|&&b| b == 0).count() } else { 0 };
     let available = end - start + slack;
 
     let codec = codec_for(entry.format);
-    let first = first_params(entry, &original)?;
-    let (stream, params) = fit(codec, header, new_data, first, available);
+    let first = match &entry.exact_params {
+        Some(p) => codec
+            .adapt_params(old_stream, &original, p)
+            .map_err(|e| Error::InvalidManifest(format!("stream {}: {e}", entry.id)))?,
+        None => codec.default_params(old_stream, &original),
+    };
+    let (stream, params) = fit(codec, old_stream, &original, new_data, &first, available);
     if stream.len() > available {
         plan.outcome = Outcome::TooLarge { best_size: stream.len() as u64, available: available as u64 };
         return Ok((plan, None));
@@ -280,8 +286,8 @@ fn plan_stream(
 
     plan.outcome = Outcome::Repacked {
         new_size: stream.len() as u64,
+        reused_original_params: entry.exact_params.is_some() && params == first,
         params,
-        reused_original_params: entry.params.exact_match && params == first,
         slack_used: (start + stream.len()).saturating_sub(end) as u64,
     };
     Ok((plan, Some(Patch { offset: start, bytes: stream, clear_to: end })))
@@ -304,39 +310,26 @@ fn sorted_streams(manifest: &Manifest, len: usize) -> Result<Vec<&StreamEntry>> 
     Ok(streams)
 }
 
-/// Settings for the first compression attempt: the exact match from the scan if there
-/// is one, else zlib's defaults. Never uses a larger window than the original header
-/// declares, since the reader may only provide that much.
-fn first_params(entry: &StreamEntry, original: &Decoded) -> Result<DeflateParams> {
-    let params = match entry.params.deflate_params().filter(|_| entry.params.exact_match) {
-        Some(p) => p,
-        None => DeflateParams::zlib_default(entry.params.window_bits.unwrap_or(15)),
-    };
-    if !params.is_valid() {
-        return Err(Error::InvalidManifest(format!("stream {} has invalid params {params}", entry.id)));
-    }
-    let cap = original.params.window_bits.unwrap_or(15);
-    Ok(DeflateParams { window_bits: params.window_bits.min(cap), ..params })
-}
-
-/// Compress with `first`; if that doesn't fit in `available` bytes, also try stronger
-/// settings with the same window and keep the smallest result.
-fn fit(codec: &dyn Codec, header: &[u8], data: &[u8], first: DeflateParams, available: usize) -> (Vec<u8>, DeflateParams) {
-    let build = |p: &DeflateParams| codec.wrap(header, &compress_raw(data, p), data);
-    let mut best = (build(&first), first);
+/// Encode with `first` (the scan's exact match, or defaults from the original header);
+/// if that doesn't fit in `available` bytes, also try the codec's stronger settings and
+/// keep the smallest result.
+fn fit(
+    codec: &dyn Codec,
+    old_stream: &[u8],
+    original: &Decoded,
+    data: &[u8],
+    first: &EncoderParams,
+    available: usize,
+) -> (Vec<u8>, EncoderParams) {
+    let build = |p: &EncoderParams| codec.encode(old_stream, original, data, p);
+    let mut best = (build(first), first.clone());
     if best.0.len() <= available {
         return best;
     }
-    for mem_level in [9, 8] {
-        for strategy in [Strategy::Default, Strategy::Filtered] {
-            let p = DeflateParams { level: 9, window_bits: first.window_bits, mem_level, strategy };
-            if p == first {
-                continue;
-            }
-            let stream = build(&p);
-            if stream.len() < best.0.len() {
-                best = (stream, p);
-            }
+    for p in codec.stronger_params(first) {
+        let stream = build(&p);
+        if stream.len() < best.0.len() {
+            best = (stream, p);
         }
     }
     best
@@ -346,13 +339,13 @@ fn packed_manifest(original: &Manifest, plans: &[StreamPlan], edits: &BTreeMap<u
     let mut manifest = original.clone();
     for entry in &mut manifest.streams {
         let Some(plan) = plans.iter().find(|p| p.id == entry.id) else { continue };
-        if let Outcome::Repacked { new_size, params, .. } = plan.outcome {
+        if let Outcome::Repacked { new_size, params, .. } = &plan.outcome {
             let new_data = &edits[&entry.id];
-            entry.compressed_size = new_size;
+            entry.compressed_size = *new_size;
             entry.decompressed_size = new_data.len() as u64;
             entry.crc32 = crc32(new_data);
-            // The new body was made with exactly these settings.
-            entry.params = CompressionParams::exact(params);
+            // The new stream was made with exactly these settings.
+            entry.exact_params = Some(params.clone());
         }
     }
     manifest

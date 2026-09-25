@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use zscan_core::{
-    Error, ExtractOptions, Manifest, Outcome, PackOptions, PackResult, ScanOptions, SourceInfo, extract_all, load_edits,
+    EncoderParams, Error, ExtractOptions, Manifest, Outcome, PackOptions, PackResult, ScanOptions, SourceInfo, extract_all, load_edits,
     pack, scan,
 };
 use zscan_fixtures::{Builder, Fixture, Kind};
@@ -83,9 +83,9 @@ fn matched_params_are_reused_and_recorded() {
     let edits = BTreeMap::from([(0, shrink(&f.expected[0].payload)), (5, shrink(&f.expected[5].payload))]);
     let (result, out) = pack_ok(&f.data, &manifest, &edits);
 
-    let Outcome::Repacked { params, reused_original_params, .. } = result.streams[0].outcome else { panic!() };
+    let Outcome::Repacked { params, reused_original_params, .. } = &result.streams[0].outcome else { panic!() };
     assert!(reused_original_params);
-    assert_eq!(Some(params), manifest.streams[0].params.deflate_params());
+    assert_eq!(Some(params), manifest.streams[0].exact_params.as_ref());
 
     // Stream 5 was made by miniz, so there were no exact params to reuse.
     let Outcome::Repacked { reused_original_params, .. } = result.streams[5].outcome else { panic!() };
@@ -94,7 +94,7 @@ fn matched_params_are_reused_and_recorded() {
     // Rescanning the packed file finds the new streams and matches their params exactly.
     let rescanned = scan(&out, &ScanOptions::default());
     assert_eq!(rescanned.len(), manifest.streams.len());
-    assert!(rescanned.iter().all(|s| s.params.exact_match));
+    assert!(rescanned.iter().all(|s| s.exact_params.is_some()));
 }
 
 #[test]
@@ -116,11 +116,21 @@ fn zlib_window_never_exceeds_header() {
     let f = zscan_fixtures::zlib_basic();
     let manifest = manifest_for(&f.data);
     let small_window = 4; // the stream whose header declares a 4 KiB window
-    assert_eq!(manifest.streams[small_window].params.window_bits, Some(12));
+    let window = |p: &EncoderParams| p.as_deflate().unwrap().window_bits;
+    assert_eq!(window(manifest.streams[small_window].exact_params.as_ref().unwrap()), 12);
     let edits = BTreeMap::from([(small_window as u32, shrink(&f.expected[small_window].payload))]);
     let (result, _) = pack_ok(&f.data, &manifest, &edits);
-    let Outcome::Repacked { params, .. } = result.streams[small_window].outcome else { panic!() };
-    assert_eq!(params.window_bits, 12);
+    let Outcome::Repacked { params, .. } = &result.streams[small_window].outcome else { panic!() };
+    assert_eq!(window(params), 12);
+
+    // Even hand-edited params can't raise the window past what the header declares.
+    let mut widened = manifest.clone();
+    if let Some(EncoderParams::Deflate(p)) = &mut widened.streams[small_window].exact_params {
+        p.window_bits = 15;
+    }
+    let result = pack(&f.data, &widened, &edits, &PackOptions::default()).unwrap();
+    let Outcome::Repacked { params, .. } = &result.streams[small_window].outcome else { panic!() };
+    assert_eq!(window(params), 12);
 }
 
 #[test]
@@ -188,7 +198,8 @@ fn rejects_bad_input() {
     assert!(matches!(pack(&changed, &manifest, &BTreeMap::new(), &opts), Err(Error::SourceMismatch(_))));
 
     let mut bad_params = manifest.clone();
-    bad_params.streams[0].params.mem_level = Some(12);
+    let Some(EncoderParams::Deflate(p)) = &mut bad_params.streams[0].exact_params else { panic!() };
+    p.mem_level = 12;
     let edits = BTreeMap::from([(0, shrink(&f.expected[0].payload))]);
     assert!(matches!(pack(&f.data, &bad_params, &edits, &opts), Err(Error::InvalidManifest(_))));
 }
@@ -242,4 +253,47 @@ fn streamed_output_matches_apply_and_verify_catches_damage() {
         let err = result.verify_output(&damaged).unwrap_err();
         assert!(matches!(err, Error::Verify { id: bad, .. } if bad as usize == id), "{err}");
     }
+}
+
+#[test]
+fn repacked_streams_of_every_format_are_reproducible() {
+    // Edit every stream of the multi-codec fixture; a rescan of the packed file must find
+    // each new stream and match the settings pack used, byte for byte.
+    let f = zscan_fixtures::codecs();
+    let manifest = manifest_for(&f.data);
+    let edits: BTreeMap<u32, Vec<u8>> =
+        manifest.streams.iter().zip(&f.expected).map(|(s, e)| (s.id, shrink(&e.payload))).collect();
+    let (result, out) = pack_ok(&f.data, &manifest, &edits);
+    let rescanned = scan(&out, &ScanOptions::default());
+    assert_eq!(rescanned.len(), manifest.streams.len());
+    let mut ctx = zscan_core::DecodeCtx::new(1 << 24);
+    for (plan, found) in result.streams.iter().zip(&rescanned) {
+        assert!(matches!(plan.outcome, Outcome::Repacked { .. }), "stream {} not repacked", plan.id);
+        assert_eq!(found.offset, plan.offset);
+        // Several settings can give identical output (for small inputs, zstd levels
+        // 16-19 do), so the rescan may name different ones; they must still rebuild it.
+        let what = format!("{} stream {}", plan.format, plan.id);
+        let params = found.exact_params.as_ref().unwrap_or_else(|| panic!("{what}: no exact params"));
+        let stream = &out[found.offset as usize..found.end() as usize];
+        let codec = zscan_core::codec_for(found.format);
+        let decoded = codec.decode(stream, &mut ctx).unwrap();
+        assert!(codec.encode(stream, &decoded, &edits[&plan.id], params) == stream, "{what}");
+    }
+}
+
+#[test]
+fn brotli_round_trip() {
+    // Brotli is never scanned for: build the manifest from streams at known offsets.
+    let f = zscan_fixtures::brotli_streams();
+    let mut manifest = Manifest::new(SourceInfo::describe(Path::new("b.bin"), &f.data), ScanOptions::default(), vec![]);
+    for e in &f.expected {
+        let found = zscan_core::decode_at(&f.data, e.offset as u64, zscan_core::Format::Brotli, 1 << 30, true).unwrap();
+        manifest.add_stream(found).unwrap();
+    }
+    let edits = BTreeMap::from([(0, shrink(&f.expected[0].payload))]);
+    let (result, out) = pack_ok(&f.data, &manifest, &edits);
+    let packed_manifest = result.verify_output(&out).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let files = extract_all(&out, &packed_manifest, dir.path(), &ExtractOptions::default()).unwrap();
+    assert_eq!(std::fs::read(&files[0].path).unwrap(), edits[&0]);
 }

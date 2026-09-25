@@ -2,7 +2,6 @@
 
 use std::path::Path;
 
-use zscan_core::deflater::compress_raw;
 use zscan_core::{
     DecodeCtx, Error, ExtractOptions, Format, Manifest, ScanOptions, SourceInfo, codec_for, decode_stream, extract_all,
     scan,
@@ -41,17 +40,17 @@ fn every_fixture_scans_exactly() {
 }
 
 #[test]
-fn matched_params_rebuild_zlib_made_streams_exactly() {
+fn matched_params_rebuild_reproducible_streams_exactly() {
     let mut ctx = DecodeCtx::new(1 << 24);
     for f in zscan_fixtures::all() {
         for (s, e) in scan(&f.data, &ScanOptions::default()).iter().zip(&f.expected) {
             let what = format!("fixture {} stream at {:#x}", f.name, e.offset);
-            assert_eq!(s.params.exact_match, e.zlib_made, "{what}");
-            let Some(params) = s.params.deflate_params().filter(|_| s.params.exact_match) else { continue };
+            assert_eq!(s.exact_params.is_some(), e.reproducible, "{what}");
+            let Some(params) = &s.exact_params else { continue };
             let original = &f.data[e.offset..e.offset + e.compressed_size];
             let codec = codec_for(s.format);
-            let header = &original[..codec.decode(original, &mut ctx).unwrap().body.start];
-            let rebuilt = codec.wrap(header, &compress_raw(&e.payload, &params), &e.payload);
+            let decoded = codec.decode(original, &mut ctx).unwrap();
+            let rebuilt = codec.encode(original, &decoded, &e.payload, params);
             assert!(rebuilt == original, "{what}: {params} does not rebuild it");
         }
     }
@@ -61,7 +60,7 @@ fn matched_params_rebuild_zlib_made_streams_exactly() {
 fn matching_can_be_turned_off() {
     let f = zscan_fixtures::zlib_basic();
     let opts = ScanOptions { match_params: false, ..Default::default() };
-    assert!(scan(&f.data, &opts).iter().all(|s| !s.params.exact_match && s.params.level.is_none()));
+    assert!(scan(&f.data, &opts).iter().all(|s| s.exact_params.is_none()));
 }
 
 #[test]
@@ -72,8 +71,12 @@ fn gzip_names_and_zlib_window_bits_are_recorded() {
     assert_eq!(names, expected);
 
     let f = zscan_fixtures::zlib_basic();
-    let bits: Vec<_> = scan(&f.data, &ScanOptions::default()).into_iter().map(|s| s.params.window_bits).collect();
-    assert_eq!(bits, [Some(15), Some(15), Some(15), Some(15), Some(12), Some(15)]);
+    let bits: Vec<_> = scan(&f.data, &ScanOptions::default())
+        .into_iter()
+        .map(|s| s.exact_params.and_then(|p| p.as_deflate().map(|d| d.window_bits)))
+        .collect();
+    // The miniz-made stream has no exact params.
+    assert_eq!(bits, [Some(15), Some(15), Some(15), Some(15), Some(12), None]);
 }
 
 #[test]
@@ -121,11 +124,13 @@ fn raw_deflate_filters() {
     assert!(scan(&data, &ScanOptions::default()).is_empty());
 
     let offsets = |opts: ScanOptions| scan(&data, &opts).iter().map(|s| s.offset).collect::<Vec<_>>();
-    let stored_ok = ScanOptions { raw_max_entropy: None, raw_min_ratio: 0.0, ..Default::default() };
-    assert_eq!(offsets(stored_ok), [offset]);
-    // Either stored-content rule alone rejects it.
-    assert!(offsets(ScanOptions { raw_max_entropy: None, ..Default::default() }).is_empty());
-    assert!(offsets(ScanOptions { raw_min_ratio: 0.0, ..Default::default() }).is_empty());
+    // With all three stored-content rules off it is found (along with random-filler
+    // garbage, which is what those rules are for); each rule alone rejects it.
+    let stored_ok = ScanOptions { raw_max_entropy: None, raw_min_ratio: 0.0, raw_min_compressed: 0, ..Default::default() };
+    assert!(offsets(stored_ok.clone()).contains(&offset));
+    assert!(!offsets(ScanOptions { raw_max_entropy: Some(7.5), ..stored_ok.clone() }).contains(&offset));
+    assert!(!offsets(ScanOptions { raw_min_ratio: 1.1, ..stored_ok.clone() }).contains(&offset));
+    assert!(!offsets(ScanOptions { raw_min_compressed: 256, ..stored_ok }).contains(&offset));
     assert_eq!(offsets(ScanOptions { raw_min_compressed: 100, ..Default::default() }), [small_offset]);
 }
 
@@ -134,7 +139,14 @@ fn stored_raw_deflate_needs_ratio_filter_off() {
     let f = zscan_fixtures::deflate_raw();
     let found = |opts: ScanOptions| scan(&f.data, &opts).len();
     assert_eq!(found(ScanOptions::default()), f.expected.len());
-    assert_eq!(found(ScanOptions { raw_min_ratio: 0.0, ..Default::default() }), f.expected.len() + 1);
+    // The fixture's level-0 stream stores 1000 bytes in one block (5 bytes of header).
+    let level0 = ScanOptions { raw_min_ratio: 0.0, raw_min_compressed: 0, ..Default::default() };
+    let known: Vec<u64> = f.expected.iter().map(|e| e.offset as u64).collect();
+    let extra: Vec<_> = scan(&f.data, &level0).into_iter().filter(|s| !known.contains(&s.offset)).collect();
+    assert!(extra.iter().any(|s| s.decompressed_size == 1000 && s.compressed_size == 1005), "{extra:?}");
+    // Lowering only one of the two limits isn't enough.
+    let ratio_only = ScanOptions { raw_min_ratio: 0.0, ..Default::default() };
+    assert_eq!(found(ratio_only), f.expected.len());
 }
 
 #[test]
@@ -219,8 +231,65 @@ fn empty_and_tiny_inputs() {
 
 #[test]
 fn kind_spelling_matches_format() {
-    for (k, f) in [(Kind::Gzip, Format::Gzip), (Kind::Zlib, Format::Zlib), (Kind::Deflate, Format::Deflate)] {
+    for (k, f) in [
+        (Kind::Gzip, Format::Gzip),
+        (Kind::Zlib, Format::Zlib),
+        (Kind::Zstd, Format::Zstd),
+        (Kind::Xz, Format::Xz),
+        (Kind::Bzip2, Format::Bzip2),
+        (Kind::Lz4, Format::Lz4),
+        (Kind::Deflate, Format::Deflate),
+        (Kind::Brotli, Format::Brotli),
+    ] {
         assert_eq!(k.as_str(), f.name());
         assert_eq!(serde_json::to_string(&f).unwrap(), format!("\"{}\"", k.as_str()));
     }
+}
+
+#[test]
+fn brotli_is_never_scanned_but_decodes_at_known_offsets() {
+    let f = zscan_fixtures::brotli_streams();
+    assert!(scan(&f.data, &ScanOptions::default()).is_empty());
+    let opts = ScanOptions { formats: vec![Format::Brotli], ..Default::default() };
+    assert!(scan(&f.data, &opts).is_empty(), "brotli is ignored even when asked for");
+
+    let found: Vec<_> =
+        f.expected.iter().map(|e| zscan_core::decode_at(&f.data, e.offset as u64, Format::Brotli, 1 << 30, true).unwrap()).collect();
+    let rows: Vec<Row> = found.iter().map(|s| (s.offset, s.format.name(), s.compressed_size, s.decompressed_size, s.crc32)).collect();
+    assert_eq!(rows, expected_rows(&f));
+    let mut ctx = DecodeCtx::new(1 << 24);
+    for (s, e) in found.iter().zip(&f.expected) {
+        let params = s.exact_params.as_ref().unwrap_or_else(|| panic!("no exact params for brotli at {:#x}", e.offset));
+        let original = &f.data[e.offset..e.offset + e.compressed_size];
+        let decoded = codec_for(Format::Brotli).decode(original, &mut ctx).unwrap();
+        assert!(codec_for(Format::Brotli).encode(original, &decoded, &e.payload, params) == original);
+    }
+}
+
+#[test]
+fn decode_at_and_add_stream() {
+    let f = zscan_fixtures::zlib_basic();
+    let mut manifest = manifest_for(&f);
+    // Drop a scanned stream and add it back by hand.
+    let removed = manifest.streams.remove(2);
+    let found = zscan_core::decode_at(&f.data, removed.offset, Format::Zlib, 1 << 30, true).unwrap();
+    assert_eq!((found.compressed_size, found.crc32), (removed.compressed_size, removed.crc32));
+    assert_eq!(found.exact_params, removed.exact_params);
+    let id = manifest.add_stream(found.clone()).unwrap();
+    assert_eq!(id, 6, "ids 0,1,3,4,5 remain, so the next free id is 6");
+    assert_eq!(manifest.streams[2].offset, removed.offset, "kept in offset order");
+    assert!(matches!(manifest.add_stream(found), Err(Error::InvalidManifest(_))), "overlap rejected");
+    // Wrong format or offset fails cleanly.
+    assert!(zscan_core::decode_at(&f.data, removed.offset + 1, Format::Zlib, 1 << 30, false).is_err());
+    assert!(zscan_core::decode_at(&f.data, u64::MAX, Format::Zlib, 1 << 30, false).is_err());
+}
+
+#[test]
+fn every_format_parses_by_name() {
+    for f in Format::ALL {
+        assert_eq!(f.name().parse::<Format>().unwrap(), f);
+        assert_eq!(serde_json::to_string(&f).unwrap(), format!("\"{}\"", f.name()));
+    }
+    assert!(!Format::SCANNABLE.contains(&Format::Brotli));
+    assert!(Format::SCANNABLE.iter().all(|f| f.scannable()));
 }

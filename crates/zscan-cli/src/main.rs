@@ -8,7 +8,7 @@ use zscan_core::entropy::{entropy_map, shannon};
 use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_MIN_SIZE, DEFAULT_RAW_MAX_ENTROPY, DEFAULT_RAW_MIN_COMPRESSED, DEFAULT_RAW_MIN_RATIO};
 use zscan_core::{
     ExtractOptions, Format, Manifest, Outcome, PackOptions, PackResult, ScanOptions, ScanStats, SourceInfo, StreamEntry,
-    StreamPlan, extract_all, input, load_edits, pack, scan, scan_with_stats,
+    StreamPlan, decode_at, extract_all, input, load_edits, pack, scan, scan_with_stats,
 };
 
 #[derive(Parser)]
@@ -82,6 +82,23 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Try decoding one format at an exact offset, and optionally add the stream to a
+    /// manifest. For formats that can't be scanned for (brotli), or to check a location
+    Try {
+        file: PathBuf,
+        /// Offset of the stream start (decimal, or hex with 0x)
+        #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
+        at: u64,
+        /// Format to decode as
+        #[arg(long)]
+        format: Format,
+        /// Add the stream to this manifest (it must describe the same file)
+        #[arg(short, long)]
+        manifest: Option<PathBuf>,
+        /// Skip searching for encoder settings that reproduce the stream exactly
+        #[arg(long)]
+        no_match: bool,
+    },
     /// Summary of a file: entropy map and the streams it contains
     Info {
         file: PathBuf,
@@ -95,19 +112,23 @@ enum Command {
 
 #[derive(Args)]
 struct ScanArgs {
-    /// Formats to look for, comma separated
-    #[arg(long, value_delimiter = ',', default_values_t = Format::ALL.to_vec())]
+    /// Formats to look for, comma separated [default: gzip, zlib, zstd, xz, bzip2, lz4,
+    /// deflate]. Brotli can't be scanned for; use `zscan try --format brotli`
+    #[arg(long, value_delimiter = ',', default_values_t = Format::SCANNABLE.to_vec(), hide_default_value = true,
+          value_parser = parse_scannable)]
     formats: Vec<Format>,
     /// Minimum decompressed size in bytes
     #[arg(long, default_value_t = DEFAULT_MIN_SIZE)]
     min_size: u64,
-    /// Minimum compressed size for raw deflate (no checksum, so more false positives)
+    /// Minimum compressed size for raw deflate/brotli (no checksum, so more false
+    /// positives). Stored deflate blocks don't count; use 0 to find level-0 raw deflate
     #[arg(long, default_value_t = DEFAULT_RAW_MIN_COMPRESSED)]
     raw_min_compressed: u64,
     /// Reject raw deflate whose output entropy is above this, bits per byte (8 disables)
     #[arg(long, default_value_t = DEFAULT_RAW_MAX_ENTROPY)]
     raw_max_entropy: f64,
-    /// Minimum decompressed/compressed ratio for raw deflate (0 finds level-0 streams)
+    /// Minimum decompressed/compressed ratio for raw deflate/brotli (0 with
+    /// --raw-min-compressed 0 finds level-0 raw deflate)
     #[arg(long, default_value_t = DEFAULT_RAW_MIN_RATIO)]
     raw_min_ratio: f64,
     /// Minimum decompressed/compressed size ratio
@@ -163,6 +184,9 @@ fn run(cli: Cli) -> Result<()> {
             let output = output.unwrap_or_else(|| default_packed_path(&file));
             let opts = PackOptions { verify_source: !force, use_zero_slack: use_slack };
             cmd_pack(&file, &manifest, &dir, &output, manifest_out.as_deref(), dry_run, &opts, cli.json)
+        }
+        Command::Try { file, at, format, manifest, no_match } => {
+            cmd_try(&file, at, format, manifest.as_deref(), !no_match, cli.json)
         }
         Command::Info { file, blocks, filters } => cmd_info(&file, blocks, &filters, cli.json),
     }
@@ -305,7 +329,7 @@ fn print_streams(streams: &[StreamEntry]) {
         "id", "offset", "format", "compressed", "decompressed", "ratio", "exact params"
     );
     for s in streams {
-        let params = s.params.deflate_params().filter(|_| s.params.exact_match).map_or("-".into(), |p| p.to_string());
+        let params = s.exact_params.as_ref().map_or("-".into(), |p| p.to_string());
         println!(
             "{:>5}  {:#010x}  {:<7}  {:>12}  {:>12}  {:>7.2}  {:<22}  {}",
             s.id,
@@ -466,14 +490,70 @@ fn write_verified(path: &Path, input_data: &[u8], result: &PackResult) -> Result
     Ok(manifest)
 }
 
+fn parse_offset(s: &str) -> Result<u64, String> {
+    let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => s.parse(),
+    };
+    parsed.map_err(|e| format!("invalid offset '{s}': {e}"))
+}
+
+fn parse_scannable(s: &str) -> Result<Format, String> {
+    let format: Format = s.parse()?;
+    if !format.scannable() {
+        return Err(format!(
+            "{format} can't be scanned for: it has no magic number and random bytes decode as it too \
+             readily. Use `zscan try <file> --at <offset> --format {format}` instead"
+        ));
+    }
+    Ok(format)
+}
+
+fn cmd_try(file: &Path, at: u64, format: Format, manifest_path: Option<&Path>, match_params: bool, json: bool) -> Result<()> {
+    let data = input::open(file)?;
+    let found = decode_at(&data, at, format, DEFAULT_MAX_OUTPUT, match_params)
+        .map_err(|e| anyhow::anyhow!("no {format} stream decodes at {at:#x}: {e}"))?;
+    let mut added = None;
+    if let Some(path) = manifest_path {
+        let mut manifest = Manifest::load(path)?;
+        manifest.source.check(&data)?;
+        added = Some(manifest.add_stream(found.clone())?);
+        manifest.save(path)?;
+    }
+    if json {
+        let report = serde_json::json!({
+            "offset": found.offset,
+            "format": found.format,
+            "compressed_size": found.compressed_size,
+            "decompressed_size": found.decompressed_size,
+            "crc32": format!("{:08x}", found.crc32),
+            "exact_params": found.exact_params,
+            "added_as": added,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "{format} stream at {:#x}: {} bytes -> {} bytes, exact params {}",
+            found.offset,
+            found.compressed_size,
+            found.decompressed_size,
+            found.exact_params.as_ref().map_or("-".into(), |p| p.to_string())
+        );
+        if let (Some(id), Some(path)) = (added, manifest_path) {
+            println!("added to {} as stream {id}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn print_stats(stats: &ScanStats) {
     let mib = stats.bytes as f64 / (1 << 20) as f64;
     let phase = |name: &str, d: std::time::Duration| {
         eprintln!("  {name:<16} {:>9.2} s  {:>9.1} MiB/s", d.as_secs_f64(), mib / d.as_secs_f64().max(1e-9));
     };
     eprintln!("scan of {mib:.1} MiB:");
-    phase("gzip/zlib pass", stats.verified_pass);
-    phase("raw deflate pass", stats.raw_pass);
+    phase("verified pass", stats.verified_pass);
+    phase("unverified pass", stats.raw_pass);
     phase("param matching", stats.param_matching);
     phase("total", stats.total());
 }

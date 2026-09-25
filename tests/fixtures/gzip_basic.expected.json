@@ -9,7 +9,7 @@
       "format": "gzip",
       "offset": 300,
       "original_name": "hello.txt",
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 1217,
@@ -18,7 +18,7 @@
       "format": "gzip",
       "offset": 2986,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 863,
@@ -27,7 +27,7 @@
       "format": "gzip",
       "offset": 4267,
       "original_name": "all_fields.bin",
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 465,
@@ -36,7 +36,7 @@
       "format": "gzip",
       "offset": 5130,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     }
   ]
 }

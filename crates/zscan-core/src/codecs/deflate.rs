@@ -1,6 +1,8 @@
 //! Raw deflate (RFC 1951).
 
-use crate::codec::{Codec, CompressionParams, DecodeCtx, DecodeError, Decoded, Format};
+use crate::codec::{Codec, DecodeCtx, DecodeError, Decoded, Format};
+use crate::deflater::{DeflateParams, Strategy, compress_raw, find_params};
+use crate::params::EncoderParams;
 
 pub struct DeflateCodec;
 
@@ -161,19 +163,89 @@ impl Codec for DeflateCodec {
 
     fn decode(&self, data: &[u8], ctx: &mut DecodeCtx) -> Result<Decoded, DecodeError> {
         let (consumed, len) = ctx.inflate(data)?;
-        Ok(Decoded {
-            compressed_size: consumed,
-            body: 0..consumed,
-            data: ctx.take_output(len),
-            params: CompressionParams::default(),
-            original_name: None,
-        })
+        Ok(Decoded { compressed_size: consumed, body: 0..consumed, data: ctx.take_output(len), original_name: None })
     }
 
-    fn wrap(&self, header: &[u8], body: &[u8], _data: &[u8]) -> Vec<u8> {
-        debug_assert!(header.is_empty());
-        body.to_vec()
+    /// Stored blocks are copied verbatim, so their contents prove nothing: only what
+    /// follows the leading stored blocks counts. A chance stored header (LEN == !NLEN)
+    /// in random data followed by a short garbage block that happens to end was the one
+    /// false positive in 1 GiB of mixed test data (stage 4).
+    fn evidence(&self, stream: &[u8]) -> usize {
+        stream.len() - stored_prefix_len(stream).min(stream.len())
     }
+
+    fn find_params(&self, stream: &[u8], decoded: &Decoded) -> Option<EncoderParams> {
+        find_family_params(stream, decoded, None)
+    }
+
+    fn default_params(&self, _stream: &[u8], _decoded: &Decoded) -> EncoderParams {
+        EncoderParams::Deflate(DeflateParams::zlib_default(15))
+    }
+
+    fn adapt_params(&self, _stream: &[u8], _decoded: &Decoded, params: &EncoderParams) -> Result<EncoderParams, String> {
+        adapt_family_params(params, 15)
+    }
+
+    fn stronger_params(&self, base: &EncoderParams) -> Vec<EncoderParams> {
+        stronger_family_params(base)
+    }
+
+    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Vec<u8> {
+        compress_raw(data, family_params(params))
+    }
+}
+
+/// Bytes taken up by the stored blocks at the start of a raw deflate stream. Stored
+/// blocks end byte-aligned, so consecutive ones can be walked without decoding.
+pub(crate) fn stored_prefix_len(stream: &[u8]) -> usize {
+    let mut pos = 0;
+    while let Some(&header) = stream.get(pos) {
+        if (header >> 1) & 3 != 0 {
+            break;
+        }
+        let Some(len) = stream.get(pos + 1..pos + 3) else { break };
+        pos += 5 + usize::from(u16::from_le_bytes([len[0], len[1]]));
+        if header & 1 != 0 {
+            break; // final block
+        }
+    }
+    pos
+}
+
+// Shared by the deflate family (gzip, zlib, raw deflate), which all encode with zlib.
+
+/// Exact settings for a deflate-family stream: search on its raw deflate body.
+pub(crate) fn find_family_params(stream: &[u8], decoded: &Decoded, window_hint: Option<u8>) -> Option<EncoderParams> {
+    find_params(&decoded.data, &stream[decoded.body.clone()], window_hint).map(EncoderParams::Deflate)
+}
+
+/// Check that `params` are valid zlib settings, capping the window at `max_window`
+/// (what the original header allows a decoder to assume).
+pub(crate) fn adapt_family_params(params: &EncoderParams, max_window: u8) -> Result<EncoderParams, String> {
+    let p = params.as_deflate().ok_or_else(|| format!("{params} are not deflate settings"))?;
+    if !p.is_valid() {
+        return Err(format!("invalid deflate settings {p}"));
+    }
+    Ok(EncoderParams::Deflate(DeflateParams { window_bits: p.window_bits.min(max_window), ..*p }))
+}
+
+/// Level 9 with each memLevel/strategy combination that tends to help, keeping the window.
+pub(crate) fn stronger_family_params(base: &EncoderParams) -> Vec<EncoderParams> {
+    let window_bits = family_params(base).window_bits;
+    let mut out = Vec::new();
+    for mem_level in [9, 8] {
+        for strategy in [Strategy::Default, Strategy::Filtered] {
+            let p = EncoderParams::Deflate(DeflateParams { level: 9, window_bits, mem_level, strategy });
+            if p != *base {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn family_params(params: &EncoderParams) -> &DeflateParams {
+    params.as_deflate().expect("deflate-family codec given non-deflate params")
 }
 
 #[cfg(test)]
@@ -234,6 +306,17 @@ mod tests {
         }
         assert_eq!(rejected, agreed);
         assert!(rejected > 40_000, "probe should reject most random fixed-block starts, got {rejected}");
+    }
+
+    #[test]
+    fn stored_prefix() {
+        let stored = [0x00, 0x02, 0x00, 0xfd, 0xff, b'a', b'b', 0x01, 0x01, 0x00, 0xfe, 0xff, b'c'];
+        assert_eq!(stored_prefix_len(&stored), stored.len());
+        assert_eq!(DeflateCodec.evidence(&stored), 0);
+        let mut mixed = stored[..7].to_vec();
+        mixed.extend([0x4b, 0x04, 0x00]); // fixed block after the first stored one
+        assert_eq!(stored_prefix_len(&mixed), 7);
+        assert_eq!(DeflateCodec.evidence(&mixed), 3);
     }
 
     #[test]

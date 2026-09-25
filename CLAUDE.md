@@ -56,13 +56,22 @@ All commands support `--json` output for scripting.
 6. GUI (egui for speed of building, or Tauri for a richer hex/preview UI): entropy map, stream table (offset, format, sizes, ratio, detected type, exact-match flag), preview pane (hex/text/image), mark edited streams, pack view with dry-run + verify, save/load manifest as a project.
 
 ## Status
-- Stages 1–2 done: `zscan scan | extract | pack | info`.
+- Stages 1–4 done: `zscan scan | extract | pack | try | info`. Formats: gzip, zlib, raw deflate, zstd, xz, bzip2, lz4 frame, and brotli (not scannable; add with `zscan try`).
+- Codec trait (stage 4): each format file owns probe/decode plus `find_params` (exact match), `default_params` (derived from the original header), `adapt_params`, `stronger_params` and `encode`. Params are the tagged `EncoderParams` enum (`params.rs`). Manifest v2 stores `exact_params`, and v1 manifests are migrated on load.
+- Exact matching per format:
+  - zstd: level search with header flags. Frames without a content size need the streaming (`e_continue` then `e_end`) path.
+  - xz: the dictionary size and threaded mode are read from the block header. Big-dictionary encoders are serialised by a mutex, since they need ~10× the dictionary in RAM.
+  - bzip2: determined by the header level.
+  - lz4: lz4_flex only; reference-lz4 frames decode and repack but don't match.
+  - brotli: quality × mode.
+- Brotli is never scanned for (`Format::scannable`): blind scanning measured ~1 MiB/s and ~1 FP per 4 MiB. Streams are added at known offsets with `decode_at` / `zscan try --at <off> --format brotli -m m.json`, then extract and pack normally.
+- Raw deflate evidence (`Codec::evidence`) excludes leading stored blocks, so level-0 raw needs `--raw-min-compressed 0 --raw-min-ratio 0`.
 - Inflate uses `miniz_oxide`'s core API directly: O(1) reset per candidate offset, one reused buffer (`DecodeCtx`). Compression uses stock zlib 1.3.2, bundled static via `libz-sys` (`deflater.rs`), because that's what most files were made with. Don't enable zlib-ng: its output differs.
 - Param matching compares only the deflate *body*. Pack reuses each stream's original header bytes (gzip name/mtime/flags, zlib FLEVEL) and recomputes the trailer. Level 0 is matched as a single `compress2`-style call, because stored block sizes depend on output buffering.
 - Pack copies unedited streams byte for byte. Edited streams try the matched params first, then level 9 × memLevel {9,8} × {default, filtered}, never with a window larger than the original header declares. Output is verified by decoding every stream before anything is written. Zero slack is opt-in (`--use-slack`); relocation and length fields are stage 5.
 - Scan runs two passes: gzip/zlib first, then raw deflate only in the gaps. A raw match that a later match starting inside it runs past is dropped as misaligned.
 - Raw deflate defaults: min 256 *compressed* bytes, output entropy ≤ 7.5, ratio ≥ 1.1. The ratio rule came from 4 GiB of mixed data, where chance stored blocks such as `00 00 00 ff ff` showed up in structured data. As a result, level-0 raw deflate is skipped unless `--raw-min-ratio 0`. See the `ScanOptions` docs.
-- Stage 3 performance, on a Core Ultra 9 285K with 24 threads and a 4 GiB mixed file: scan 11 s (≈400 MiB/s), extract 2 s, pack including write and read-back verify 7.5 s. Private memory stays under 35 MiB for every command. The raw pass runs 30 MiB/s single-threaded.
+- Stage 3 performance, on a Core Ultra 9 285K with 24 threads and a 4 GiB mixed file: scan 11 s (≈400 MiB/s), extract 2 s, pack including write and read-back verify 7.5 s. Private memory stays under 35 MiB for every command. The raw pass runs 30 MiB/s single-threaded. Stage 4 added ~1 s per 4 GiB for the extra magic probes.
   - The fixed-Huffman static-table probe (`probe_fixed_block`) gave a 10× speedup. It must only reject what inflate rejects; unit tests enforce that.
   - `DecodeCtx::take_output` copies, never moves: moving the buffer re-zeroed MBs after every garbage hit, which made scanning 60× slower.
 - Parallel scan (`scan_chunked`) collects every hit per chunk without skipping, then replays skip-past and lookahead sequentially. Results must be identical to the sequential oracle in `scan.rs` tests for any chunk size. Keep `try_at` a pure function of (offset, window end).

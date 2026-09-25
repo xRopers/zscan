@@ -9,7 +9,7 @@
       "format": "zlib",
       "offset": 1000,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 4042,
@@ -18,7 +18,7 @@
       "format": "zlib",
       "offset": 2996,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 1031,
@@ -27,7 +27,7 @@
       "format": "zlib",
       "offset": 7138,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 111,
@@ -36,7 +36,7 @@
       "format": "zlib",
       "offset": 8169,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 561,
@@ -45,7 +45,7 @@
       "format": "zlib",
       "offset": 8280,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 995,
@@ -54,7 +54,7 @@
       "format": "zlib",
       "offset": 9341,
       "original_name": null,
-      "zlib_made": false
+      "reproducible": false
     }
   ]
 }

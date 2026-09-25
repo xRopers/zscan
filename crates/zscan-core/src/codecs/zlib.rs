@@ -2,7 +2,10 @@
 
 use super::deflate::probe_block_header;
 use crate::checksum::adler32;
-use crate::codec::{Codec, CompressionParams, DecodeCtx, DecodeError, Decoded, Format};
+use super::deflate::{adapt_family_params, family_params, find_family_params, stronger_family_params};
+use crate::codec::{Codec, DecodeCtx, DecodeError, Decoded, Format};
+use crate::deflater::{DeflateParams, compress_raw};
+use crate::params::EncoderParams;
 
 pub struct ZlibCodec;
 
@@ -35,7 +38,7 @@ impl Codec for ZlibCodec {
     }
 
     fn decode(&self, data: &[u8], ctx: &mut DecodeCtx) -> Result<Decoded, DecodeError> {
-        let window_bits = parse_header(data).ok_or(DecodeError::BadHeader)?;
+        parse_header(data).ok_or(DecodeError::BadHeader)?;
         let (consumed, len) = ctx.inflate(&data[HEADER_LEN..])?;
         let end = HEADER_LEN + consumed;
         let trailer = data.get(end..end + TRAILER_LEN).ok_or(DecodeError::Truncated)?;
@@ -43,22 +46,40 @@ impl Codec for ZlibCodec {
         if adler32(ctx.output(len)) != stored {
             return Err(DecodeError::ChecksumMismatch);
         }
-        Ok(Decoded {
-            compressed_size: end + TRAILER_LEN,
-            body: HEADER_LEN..end,
-            data: ctx.take_output(len),
-            params: CompressionParams { window_bits: Some(window_bits), ..Default::default() },
-            original_name: None,
-        })
+        Ok(Decoded { compressed_size: end + TRAILER_LEN, body: HEADER_LEN..end, data: ctx.take_output(len), original_name: None })
     }
 
-    fn wrap(&self, header: &[u8], body: &[u8], data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(header.len() + body.len() + TRAILER_LEN);
-        out.extend_from_slice(header);
-        out.extend_from_slice(body);
+    fn find_params(&self, stream: &[u8], decoded: &Decoded) -> Option<EncoderParams> {
+        find_family_params(stream, decoded, parse_header(stream))
+    }
+
+    fn default_params(&self, stream: &[u8], _decoded: &Decoded) -> EncoderParams {
+        EncoderParams::Deflate(DeflateParams::zlib_default(header_window(stream)))
+    }
+
+    fn adapt_params(&self, stream: &[u8], _decoded: &Decoded, params: &EncoderParams) -> Result<EncoderParams, String> {
+        // The header declares the largest window a decoder must provide; never exceed it.
+        adapt_family_params(params, header_window(stream))
+    }
+
+    fn stronger_params(&self, base: &EncoderParams) -> Vec<EncoderParams> {
+        stronger_family_params(base)
+    }
+
+    /// Reuses the original 2-byte header and appends a fresh Adler-32.
+    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Vec<u8> {
+        let body = compress_raw(data, family_params(params));
+        let mut out = Vec::with_capacity(HEADER_LEN + body.len() + TRAILER_LEN);
+        out.extend_from_slice(&stream[..decoded.body.start]);
+        out.extend_from_slice(&body);
         out.extend_from_slice(&adler32(data).to_be_bytes());
         out
     }
+}
+
+/// Window bits declared by a zlib header, clamped to what zlib can encode with (9..=15).
+fn header_window(stream: &[u8]) -> u8 {
+    parse_header(stream).unwrap_or(15).max(9)
 }
 
 #[cfg(test)]
@@ -85,7 +106,10 @@ mod tests {
         let d = ZlibCodec.decode(&stream, &mut ctx).unwrap();
         assert_eq!(d.data, b"hello");
         assert_eq!(d.compressed_size, stream.len());
-        assert_eq!(d.params.window_bits, Some(15));
+        // Made by zlib at its defaults, so the search finds them and encode rebuilds it.
+        let found = ZlibCodec.find_params(&stream, &d).unwrap();
+        assert_eq!(found, EncoderParams::Deflate(DeflateParams::zlib_default(15)));
+        assert_eq!(ZlibCodec.encode(&stream, &d, b"hello", &found), stream);
 
         let mut bad = stream;
         bad[12] ^= 1;

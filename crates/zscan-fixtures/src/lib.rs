@@ -3,8 +3,9 @@
 //!
 //! `cargo run -p zscan-fixtures --bin gen-fixtures` writes them to `tests/fixtures/`.
 //!
-//! Streams are made with stock zlib (flate2's zlib backend), so the scanner's parameter
-//! matching should reproduce them exactly, except ones marked `zlib_made: false`.
+//! Streams are made with the same encoder libraries zscan uses (zlib via flate2, libzstd,
+//! liblzma, libbzip2's Rust port, lz4_flex, brotli), so the scanner's parameter matching
+//! should reproduce them exactly, except ones marked `reproducible: false`.
 
 use std::io::Write;
 
@@ -16,7 +17,12 @@ use flate2::write::{DeflateEncoder, ZlibEncoder};
 pub enum Kind {
     Gzip,
     Zlib,
+    Zstd,
+    Xz,
+    Bzip2,
+    Lz4,
     Deflate,
+    Brotli,
 }
 
 impl Kind {
@@ -25,7 +31,12 @@ impl Kind {
         match self {
             Kind::Gzip => "gzip",
             Kind::Zlib => "zlib",
+            Kind::Zstd => "zstd",
+            Kind::Xz => "xz",
+            Kind::Bzip2 => "bzip2",
+            Kind::Lz4 => "lz4",
             Kind::Deflate => "deflate",
+            Kind::Brotli => "brotli",
         }
     }
 }
@@ -38,8 +49,9 @@ pub struct Expected {
     pub compressed_size: usize,
     pub payload: Vec<u8>,
     pub name: Option<String>,
-    /// Made by stock zlib, so some zlib setting reproduces it byte for byte.
-    pub zlib_made: bool,
+    /// Made by the encoder library zscan uses for this format, so some setting
+    /// reproduces it byte for byte.
+    pub reproducible: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -218,12 +230,12 @@ impl Builder {
     /// Like [`Builder::stream`], for a stream not made by zlib.
     pub fn foreign_stream(&mut self, kind: Kind, encoded: Vec<u8>, payload: Vec<u8>) {
         self.stream(kind, encoded, payload, None);
-        self.expected.last_mut().unwrap().zlib_made = false;
+        self.expected.last_mut().unwrap().reproducible = false;
     }
 
     /// Record an expected stream at an arbitrary offset (for streams nested in other bytes).
     pub fn expect(&mut self, offset: usize, kind: Kind, compressed_size: usize, payload: Vec<u8>, name: Option<&str>) {
-        self.expected.push(Expected { offset, kind, compressed_size, payload, name: name.map(String::from), zlib_made: true });
+        self.expected.push(Expected { offset, kind, compressed_size, payload, name: name.map(String::from), reproducible: true });
     }
 
     pub fn finish(mut self, name: &'static str, description: &'static str) -> Fixture {
@@ -232,8 +244,175 @@ impl Builder {
     }
 }
 
+/// Every fixture found with the default formats. [`brotli_streams`] needs brotli enabled.
 pub fn all() -> Vec<Fixture> {
-    vec![zlib_basic(), gzip_basic(), deflate_raw(), mixed(), noise()]
+    vec![zlib_basic(), gzip_basic(), deflate_raw(), mixed(), codecs(), noise()]
+}
+
+pub fn zstd_frame(payload: &[u8], level: i32, checksum: bool) -> Vec<u8> {
+    let mut c = zstd::bulk::Compressor::new(level).unwrap();
+    c.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(checksum)).unwrap();
+    c.compress(payload).unwrap()
+}
+
+/// zstd's streaming encoder with no size given up front: no content size in the header.
+pub fn zstd_streamed(payload: &[u8], level: i32) -> Vec<u8> {
+    let mut e = zstd::stream::Encoder::new(Vec::new(), level).unwrap();
+    e.write_all(payload).unwrap();
+    e.finish().unwrap()
+}
+
+/// liblzma's easy encoder (what xz2 and Python's lzma use), CRC-64.
+pub fn xz_easy(payload: &[u8], preset: u32) -> Vec<u8> {
+    let mut e = xz2::write::XzEncoder::new(Vec::new(), preset);
+    e.write_all(payload).unwrap();
+    e.finish().unwrap()
+}
+
+/// Like the `xz` tool: dictionary shrunk to fit the input, CRC-32 check, optionally the
+/// multithreaded encoder (which records block sizes in the block header).
+pub fn xz_tool_like(payload: &[u8], preset: u32, threaded: bool) -> Vec<u8> {
+    use xz2::stream::{Check, Filters, LzmaOptions, MtStreamBuilder, Stream};
+    let mut opts = LzmaOptions::new_preset(preset).unwrap();
+    opts.dict_size((payload.len() as u32).next_power_of_two().max(4096));
+    let mut filters = Filters::new();
+    filters.lzma2(&opts);
+    let stream = if threaded {
+        MtStreamBuilder::new().threads(2).filters(filters).check(Check::Crc32).encoder().unwrap()
+    } else {
+        Stream::new_stream_encoder(&filters, Check::Crc32).unwrap()
+    };
+    let mut e = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+    e.write_all(payload).unwrap();
+    e.finish().unwrap()
+}
+
+pub fn bzip2(payload: &[u8], level: u32) -> Vec<u8> {
+    let mut e = ::bzip2::write::BzEncoder::new(Vec::new(), ::bzip2::Compression::new(level));
+    e.write_all(payload).unwrap();
+    e.finish().unwrap()
+}
+
+/// lz4_flex frame. With `linked`, blocks may reference earlier blocks and every
+/// checksum is on.
+pub fn lz4_frame(payload: &[u8], linked: bool) -> Vec<u8> {
+    use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
+    let info = if linked {
+        FrameInfo::new()
+            .block_size(BlockSize::Max64KB)
+            .block_mode(BlockMode::Linked)
+            .block_checksums(true)
+            .content_checksum(true)
+            .content_size(Some(payload.len() as u64))
+    } else {
+        FrameInfo::new()
+    };
+    let mut e = FrameEncoder::with_frame_info(info, Vec::new());
+    e.write_all(payload).unwrap();
+    e.finish().unwrap()
+}
+
+/// An LZ4 frame of stored (uncompressed) blocks with a content checksum, built by hand.
+/// Valid, but no lz4_flex setting produces it.
+pub fn lz4_stored_frame(payload: &[u8]) -> Vec<u8> {
+    use xxhash_rust::xxh32::xxh32;
+    let mut out = vec![0x04, 0x22, 0x4d, 0x18];
+    let descriptor = [0x64, 0x40]; // version 01, independent blocks, content checksum; 64 KiB blocks
+    out.extend(descriptor);
+    out.push((xxh32(&descriptor, 0) >> 8) as u8);
+    for block in payload.chunks(64 * 1024) {
+        out.extend((block.len() as u32 | 0x8000_0000).to_le_bytes());
+        out.extend(block);
+    }
+    out.extend(0u32.to_le_bytes());
+    out.extend(xxh32(payload, 0).to_le_bytes());
+    out
+}
+
+pub fn brotli(payload: &[u8], quality: u32, lgwin: u32) -> Vec<u8> {
+    let params = ::brotli::enc::backward_references::BrotliEncoderParams {
+        quality: quality as i32,
+        lgwin: lgwin as i32,
+        size_hint: payload.len(),
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    ::brotli::BrotliCompress(&mut &payload[..], &mut out, &params).unwrap();
+    out
+}
+
+pub fn codecs() -> Fixture {
+    let mut b = Builder::new(5);
+    b.random(700);
+    let p = b.text(9000);
+    b.stream(Kind::Zstd, zstd_frame(&p, 3, false), p, None);
+    b.random(300);
+    let p = b.records(20_000);
+    b.stream(Kind::Zstd, zstd_frame(&p, 19, true), p, None);
+    b.random(300);
+    let p = b.text(5000);
+    b.stream(Kind::Zstd, zstd_streamed(&p, 5), p, None);
+    b.random(300);
+    let p = b.text(7000);
+    b.stream(Kind::Xz, xz_easy(&p, 6), p, None);
+    b.random(300);
+    let p = b.records(6000);
+    b.stream(Kind::Xz, xz_tool_like(&p, 3, false), p, None);
+    b.random(300);
+    let p = b.text(8000);
+    b.stream(Kind::Xz, xz_tool_like(&p, 6, true), p, None);
+    b.random(300);
+    let p = b.text(12_000);
+    b.stream(Kind::Bzip2, bzip2(&p, 9), p, None);
+    b.random(300);
+    let p = b.records(3000);
+    b.stream(Kind::Bzip2, bzip2(&p, 1), p, None);
+    b.random(300);
+    let p = b.text(10_000);
+    b.stream(Kind::Lz4, lz4_frame(&p, false), p, None);
+    b.random(300);
+    let p = b.text(150_000);
+    b.stream(Kind::Lz4, lz4_frame(&p, true), p, None);
+    b.random(300);
+    let p = b.text(2000);
+    b.foreign_stream(Kind::Lz4, lz4_stored_frame(&p), p);
+    b.random(300);
+
+    // Traps: real magic numbers followed by garbage.
+    b.raw(&[0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x10]);
+    b.random(200);
+    b.raw(b"BZh91AY&SY");
+    b.random(200);
+    b.raw(&[0xfd, b'7', b'z', b'X', b'Z', 0, 0, 0x04, 0xe6, 0xd6, 0xb4, 0x46]); // valid xz stream header
+    b.random(200);
+    b.raw(&lz4_frame(b"x", false)[..7]); // valid lz4 frame header
+    b.random(200);
+    // Trap: a truncated zstd frame.
+    let p = b.text(4000);
+    let z = zstd_frame(&p, 3, true);
+    b.raw(&z[..z.len() - 10]);
+    b.random(200);
+    // Trap: a zstd frame whose content checksum is wrong.
+    let p = b.text(4000);
+    let mut z = zstd_frame(&p, 3, true);
+    let last = z.len() - 1;
+    z[last] ^= 0x55;
+    b.raw(&z);
+    b.random(500);
+    b.finish("codecs", "zstd, xz, bzip2 and lz4 streams in several configurations, plus traps for each format")
+}
+
+/// Brotli streams, which have no magic number and are only scanned when asked for.
+pub fn brotli_streams() -> Fixture {
+    let mut b = Builder::new(6);
+    b.random(1000);
+    let p = b.text(20_000);
+    b.stream(Kind::Brotli, brotli(&p, 11, 22), p, None);
+    b.random(1000);
+    let p = b.records(8000);
+    b.stream(Kind::Brotli, brotli(&p, 5, 18), p, None);
+    b.random(1000);
+    b.finish("brotli", "brotli streams (quality 11 and 5) in random filler; scan with brotli enabled")
 }
 
 pub fn zlib_basic() -> Fixture {

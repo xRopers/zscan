@@ -9,7 +9,7 @@
       "format": "deflate",
       "offset": 2048,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 1117,
@@ -18,7 +18,7 @@
       "format": "deflate",
       "offset": 6836,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     }
   ]
 }

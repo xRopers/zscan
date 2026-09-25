@@ -9,7 +9,7 @@ use serde_json::json;
 fn main() -> std::io::Result<()> {
     let dir = std::env::args().nth(1).map_or_else(|| PathBuf::from("tests/fixtures"), PathBuf::from);
     fs::create_dir_all(&dir)?;
-    for fixture in zscan_fixtures::all() {
+    for fixture in zscan_fixtures::all().into_iter().chain([zscan_fixtures::brotli_streams()]) {
         let streams: Vec<_> = fixture
             .expected
             .iter()
@@ -21,7 +21,7 @@ fn main() -> std::io::Result<()> {
                     "decompressed_size": e.payload.len(),
                     "crc32": format!("{:08x}", crc32fast::hash(&e.payload)),
                     "original_name": e.name,
-                    "zlib_made": e.zlib_made,
+                    "reproducible": e.reproducible,
                 })
             })
             .collect();

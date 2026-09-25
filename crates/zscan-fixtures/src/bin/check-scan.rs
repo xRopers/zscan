@@ -34,7 +34,7 @@ fn main() {
     let read = |p: &str| -> Value { serde_json::from_str(&std::fs::read_to_string(p).expect(p)).expect(p) };
     let manifest = read(&args[1]);
     let (found, expected) = (keys(&manifest), keys(&read(&args[2])));
-    let exact = manifest["streams"].as_array().unwrap().iter().filter(|s| s["params"]["exact_match"] == true).count();
+    let exact = manifest["streams"].as_array().unwrap().iter().filter(|s| !s["exact_params"].is_null()).count();
     let missing: Vec<_> = expected.difference(&found).collect();
     let extra: Vec<_> = found.difference(&expected).collect();
     println!(

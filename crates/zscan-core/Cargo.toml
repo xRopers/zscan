@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+brotli.workspace = true
+bzip2.workspace = true
+lz4_flex.workspace = true
+xz2.workspace = true
+zstd.workspace = true
 crc32fast.workspace = true
 libz-sys.workspace = true
 memmap2.workspace = true
@@ -14,6 +19,7 @@ rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

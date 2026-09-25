@@ -9,7 +9,7 @@
       "format": "zlib",
       "offset": 512,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 1005,
@@ -18,7 +18,7 @@
       "format": "gzip",
       "offset": 1628,
       "original_name": "inner.txt",
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 1472,
@@ -27,7 +27,7 @@
       "format": "deflate",
       "offset": 2733,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     },
     {
       "compressed_size": 780,
@@ -36,7 +36,7 @@
       "format": "deflate",
       "offset": 4819,
       "original_name": null,
-      "zlib_made": true
+      "reproducible": true
     }
   ]
 }

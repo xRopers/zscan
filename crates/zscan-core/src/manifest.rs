@@ -6,11 +6,14 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::checksum::crc32;
-use crate::codec::{CompressionParams, Format};
+use crate::codec::Format;
 use crate::error::{Error, Result, io_err};
+use crate::params::EncoderParams;
 use crate::scan::{FoundStream, ScanOptions};
 
-pub const MANIFEST_VERSION: u32 = 1;
+/// Version 2 replaced v1's deflate-only `params` with `exact_params`, tagged by encoder.
+/// Version 1 manifests are migrated on load.
+pub const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -36,8 +39,9 @@ pub struct StreamEntry {
     pub compressed_size: u64,
     pub decompressed_size: u64,
     pub format: Format,
-    #[serde(default)]
-    pub params: CompressionParams,
+    /// Settings that reproduce the stream exactly, if the scan found any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_params: Option<EncoderParams>,
     /// CRC-32 of the original decompressed data.
     #[serde(with = "hex_u32")]
     pub crc32: u32,
@@ -121,7 +125,7 @@ impl Manifest {
                 compressed_size: s.compressed_size,
                 decompressed_size: s.decompressed_size,
                 format: s.format,
-                params: s.params,
+                exact_params: s.exact_params,
                 crc32: s.crc32,
                 original_name: s.original_name,
                 length_fields: Vec::new(),
@@ -130,12 +134,46 @@ impl Manifest {
         Self { version: MANIFEST_VERSION, source, scan_options, streams }
     }
 
-    pub fn from_json(text: &str) -> Result<Self> {
-        let manifest: Manifest = serde_json::from_str(text)?;
-        if manifest.version != MANIFEST_VERSION {
-            return Err(Error::ManifestVersion { found: manifest.version, expected: MANIFEST_VERSION });
+    /// Add a stream found outside a scan (e.g. by [`decode_at`](crate::scan::decode_at)).
+    /// It gets the next free id. Errors if it overlaps a stream already listed.
+    pub fn add_stream(&mut self, found: FoundStream) -> Result<u32> {
+        if let Some(clash) = self.streams.iter().find(|s| found.offset < s.end() && s.offset < found.end()) {
+            return Err(Error::InvalidManifest(format!(
+                "a {} stream at {:#x} overlaps stream {} ({} at {:#x})",
+                found.format, found.offset, clash.id, clash.format, clash.offset
+            )));
         }
-        Ok(manifest)
+        let id = self.streams.iter().map(|s| s.id + 1).max().unwrap_or(0);
+        let pos = self.streams.partition_point(|s| s.offset < found.offset);
+        self.streams.insert(
+            pos,
+            StreamEntry {
+                id,
+                file: stream_filename(found.offset, found.original_name.as_deref()),
+                offset: found.offset,
+                compressed_size: found.compressed_size,
+                decompressed_size: found.decompressed_size,
+                format: found.format,
+                exact_params: found.exact_params,
+                crc32: found.crc32,
+                original_name: found.original_name,
+                length_fields: Vec::new(),
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn from_json(text: &str) -> Result<Self> {
+        let mut value: serde_json::Value = serde_json::from_str(text)?;
+        match value["version"].as_u64() {
+            Some(1) => migrate_v1(&mut value),
+            Some(v) if v == u64::from(MANIFEST_VERSION) => {}
+            other => {
+                let found = other.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+                return Err(Error::ManifestVersion { found, expected: MANIFEST_VERSION });
+            }
+        }
+        Ok(serde_json::from_value(value)?)
     }
 
     pub fn to_json(&self) -> String {
@@ -149,6 +187,29 @@ impl Manifest {
     pub fn save(&self, path: &Path) -> Result<()> {
         fs::write(path, self.to_json() + "\n").map_err(io_err(path))
     }
+}
+
+/// v1 streams had `params: {level, window_bits, mem_level, strategy, exact_match}`, always
+/// zlib deflate settings. Keep them only when they were an exact match.
+fn migrate_v1(manifest: &mut serde_json::Value) {
+    if let Some(streams) = manifest["streams"].as_array_mut() {
+        for stream in streams {
+            let Some(obj) = stream.as_object_mut() else { continue };
+            let Some(params) = obj.remove("params") else { continue };
+            let complete = ["level", "window_bits", "mem_level", "strategy"].iter().all(|k| !params[*k].is_null());
+            if params["exact_match"] == true && complete {
+                let exact = serde_json::json!({
+                    "encoder": "deflate",
+                    "level": params["level"],
+                    "window_bits": params["window_bits"],
+                    "mem_level": params["mem_level"],
+                    "strategy": params["strategy"],
+                });
+                obj.insert("exact_params".into(), exact);
+            }
+        }
+    }
+    manifest["version"] = MANIFEST_VERSION.into();
 }
 
 /// Output file name for a stream: `<offset>.dat`, or `<offset>_<name>` when the stream
@@ -215,9 +276,29 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v1_params() {
+        let v1 = r#"{
+          "version": 1,
+          "source": { "path": "x", "size": 3, "crc32": "352441c2" },
+          "scan_options": { "formats": ["zlib"], "min_size": 32, "raw_min_compressed": 256, "min_ratio": 0.0, "max_output": 1024 },
+          "streams": [
+            { "id": 0, "offset": 0, "compressed_size": 10, "decompressed_size": 20, "format": "zlib", "crc32": "00000001",
+              "file": "a.dat", "params": { "level": 9, "window_bits": 15, "mem_level": 8, "strategy": "default", "exact_match": true } },
+            { "id": 1, "offset": 10, "compressed_size": 10, "decompressed_size": 20, "format": "zlib", "crc32": "00000002",
+              "file": "b.dat", "params": { "window_bits": 12, "exact_match": false } }
+          ]
+        }"#;
+        let m = Manifest::from_json(v1).unwrap();
+        assert_eq!(m.version, MANIFEST_VERSION);
+        let expected = crate::params::DeflateParams { level: 9, window_bits: 15, mem_level: 8, strategy: crate::params::Strategy::Default };
+        assert_eq!(m.streams[0].exact_params, Some(EncoderParams::Deflate(expected)));
+        assert_eq!(m.streams[1].exact_params, None);
+    }
+
+    #[test]
     fn rejects_other_versions() {
         let m = Manifest::new(SourceInfo::describe(Path::new("x"), b"abc"), ScanOptions::default(), vec![]);
-        let text = m.to_json().replace("\"version\": 1", "\"version\": 99");
+        let text = m.to_json().replace("\"version\": 2", "\"version\": 99");
         assert!(matches!(Manifest::from_json(&text), Err(Error::ManifestVersion { found: 99, .. })));
     }
 }

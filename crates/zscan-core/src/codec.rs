@@ -8,8 +8,8 @@ use miniz_oxide::inflate::TINFLStatus;
 use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 use serde::{Deserialize, Serialize};
 
-use crate::codecs::{DeflateCodec, GzipCodec, ZlibCodec};
-use crate::deflater::DeflateParams;
+use crate::codecs::{BrotliCodec, Bzip2Codec, DeflateCodec, GzipCodec, Lz4Codec, XzCodec, ZlibCodec, ZstdCodec};
+use crate::params::EncoderParams;
 
 /// Compressed stream formats. Declaration order is scan priority: when two formats
 /// match at the same offset, the earlier (better verified) one wins.
@@ -20,18 +20,53 @@ pub enum Format {
     Gzip,
     /// RFC 1950: 2-byte header, deflate body, Adler-32 trailer.
     Zlib,
+    /// Zstandard frame: 32-bit magic, optional XXH64 content checksum.
+    Zstd,
+    /// .xz stream: magic, CRC-protected headers, optional content check.
+    Xz,
+    /// bzip2 stream: `BZh` + level, 48-bit block magic, per-block CRC.
+    Bzip2,
+    /// LZ4 frame: 32-bit magic, header checksum, optional block/content checksums.
+    Lz4,
     /// RFC 1951 raw deflate. No header or checksum, so the weakest evidence.
     Deflate,
+    /// RFC 7932 brotli. No magic or checksum, and random bytes decode as brotli too
+    /// readily, so it is never scanned for: decode it at a known offset with
+    /// [`decode_at`](crate::scan::decode_at).
+    Brotli,
 }
 
 impl Format {
-    pub const ALL: [Format; 3] = [Format::Gzip, Format::Zlib, Format::Deflate];
+    pub const ALL: [Format; 8] = [
+        Format::Gzip,
+        Format::Zlib,
+        Format::Zstd,
+        Format::Xz,
+        Format::Bzip2,
+        Format::Lz4,
+        Format::Deflate,
+        Format::Brotli,
+    ];
+
+    /// Every format a scan can look for (all but brotli), and the default.
+    pub const SCANNABLE: [Format; 7] =
+        [Format::Gzip, Format::Zlib, Format::Zstd, Format::Xz, Format::Bzip2, Format::Lz4, Format::Deflate];
+
+    /// Whether blind scanning for this format gives trustworthy results.
+    pub fn scannable(self) -> bool {
+        self != Format::Brotli
+    }
 
     pub fn name(self) -> &'static str {
         match self {
             Format::Gzip => "gzip",
             Format::Zlib => "zlib",
+            Format::Zstd => "zstd",
+            Format::Xz => "xz",
+            Format::Bzip2 => "bzip2",
+            Format::Lz4 => "lz4",
             Format::Deflate => "deflate",
+            Format::Brotli => "brotli",
         }
     }
 }
@@ -49,60 +84,16 @@ impl FromStr for Format {
         match s.to_ascii_lowercase().as_str() {
             "gzip" | "gz" => Ok(Format::Gzip),
             "zlib" => Ok(Format::Zlib),
+            "zstd" | "zst" => Ok(Format::Zstd),
+            "xz" => Ok(Format::Xz),
+            "bzip2" | "bz2" => Ok(Format::Bzip2),
+            "lz4" => Ok(Format::Lz4),
             "deflate" | "raw" => Ok(Format::Deflate),
-            other => Err(format!("unknown format '{other}' (expected gzip, zlib or deflate)")),
+            "brotli" | "br" => Ok(Format::Brotli),
+            other => Err(format!(
+                "unknown format '{other}' (expected one of gzip, zlib, zstd, xz, bzip2, lz4, deflate, brotli)"
+            )),
         }
-    }
-}
-
-/// zlib compression strategies (for parameter matching in build stage 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Strategy {
-    Default,
-    Filtered,
-    HuffmanOnly,
-    Rle,
-    Fixed,
-}
-
-/// Compressor settings known for a stream. At stage 1 only what the header states is
-/// filled in; stage 2 fills in the rest by recompressing and sets `exact_match`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompressionParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub level: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window_bits: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mem_level: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<Strategy>,
-    /// True when recompressing with these params reproduces the original bytes exactly.
-    #[serde(default)]
-    pub exact_match: bool,
-}
-
-impl CompressionParams {
-    /// Params known to reproduce the original stream exactly.
-    pub fn exact(p: DeflateParams) -> Self {
-        Self {
-            level: Some(p.level),
-            window_bits: Some(p.window_bits),
-            mem_level: Some(p.mem_level),
-            strategy: Some(p.strategy),
-            exact_match: true,
-        }
-    }
-
-    /// The complete settings, if every field is known.
-    pub fn deflate_params(&self) -> Option<DeflateParams> {
-        Some(DeflateParams {
-            level: self.level?,
-            window_bits: self.window_bits?,
-            mem_level: self.mem_level?,
-            strategy: self.strategy?,
-        })
     }
 }
 
@@ -111,10 +102,11 @@ impl CompressionParams {
 pub struct Decoded {
     /// Bytes the whole stream occupies in the input, including header and trailer.
     pub compressed_size: usize,
-    /// Where the raw deflate body sits within the stream. Everything before it is header.
+    /// Where the compressed body sits within the stream: for the deflate family, the raw
+    /// deflate data, with everything before it being header. Other formats use the
+    /// whole stream.
     pub body: Range<usize>,
     pub data: Vec<u8>,
-    pub params: CompressionParams,
     /// File name stored in the stream header (gzip FNAME), if any.
     pub original_name: Option<String>,
 }
@@ -137,8 +129,9 @@ pub enum DecodeError {
 pub trait Codec: Send + Sync {
     fn format(&self) -> Format;
 
-    /// Whether the format carries its own integrity check (header check and/or checksum).
-    /// The scanner trusts these formats first and only looks for raw deflate in the gaps.
+    /// Whether the format carries its own integrity check (magic, header check and/or
+    /// checksum). The scanner looks for these first, then for unverified formats (raw
+    /// deflate, brotli) only in the gaps, under stricter filters.
     fn self_verifying(&self) -> bool;
 
     /// Cheap test on the first few bytes of `data`. May return false positives but
@@ -148,10 +141,33 @@ pub trait Codec: Send + Sync {
     /// Decode a stream that starts at `data[0]`. `data` may extend past the stream end.
     fn decode(&self, data: &[u8], ctx: &mut DecodeCtx) -> Result<Decoded, DecodeError>;
 
-    /// Build a complete stream from `header` (the original stream's bytes before its
-    /// body, reused as-is), a new raw deflate `body`, and the uncompressed `data` it
-    /// encodes (for the trailer).
-    fn wrap(&self, header: &[u8], body: &[u8], data: &[u8]) -> Vec<u8>;
+    /// For unverified formats: how many bytes of `stream` count as evidence that it is
+    /// real, compared against the raw minimum compressed size. Defaults to all of it.
+    fn evidence(&self, stream: &[u8]) -> usize {
+        stream.len()
+    }
+
+    /// Search for encoder settings with which [`Codec::encode`] reproduces `stream`
+    /// (`decoded` is its decode) byte for byte.
+    fn find_params(&self, stream: &[u8], decoded: &Decoded) -> Option<EncoderParams>;
+
+    /// Settings for re-encoding when no exact match is known, taken from what the
+    /// original stream's header says (window size, check type, flags...).
+    fn default_params(&self, stream: &[u8], decoded: &Decoded) -> EncoderParams;
+
+    /// Check recorded settings (e.g. from a hand-edited manifest) against this format
+    /// and the original stream, adjusting them where the header constrains them
+    /// (a zlib header's window size, for instance).
+    fn adapt_params(&self, stream: &[u8], decoded: &Decoded, params: &EncoderParams) -> Result<EncoderParams, String>;
+
+    /// Stronger settings to try when an edited stream doesn't fit its slot.
+    fn stronger_params(&self, base: &EncoderParams) -> Vec<EncoderParams>;
+
+    /// Encode `data` as a complete stream to replace `stream`, reusing whatever header
+    /// fields the format allows (a gzip file name, for instance). Deterministic: the same
+    /// inputs always give the same bytes. Panics if `params` belong to another encoder;
+    /// use [`Codec::adapt_params`] first on untrusted params.
+    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Vec<u8>;
 }
 
 /// The codec implementation for a format.
@@ -159,7 +175,12 @@ pub fn codec_for(format: Format) -> &'static dyn Codec {
     match format {
         Format::Gzip => &GzipCodec,
         Format::Zlib => &ZlibCodec,
+        Format::Zstd => &ZstdCodec,
+        Format::Xz => &XzCodec,
+        Format::Bzip2 => &Bzip2Codec,
+        Format::Lz4 => &Lz4Codec,
         Format::Deflate => &DeflateCodec,
+        Format::Brotli => &BrotliCodec,
     }
 }
 

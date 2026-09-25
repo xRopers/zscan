@@ -183,3 +183,37 @@ fn pack_refuses_to_overwrite_input() {
     assert!(!out.status.success());
     assert_eq!(std::fs::read(&input).unwrap(), before);
 }
+
+#[test]
+fn brotli_via_try_then_extract_and_pack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = zscan_fixtures::brotli_streams();
+    let input = write_fixture(tmp.path(), &f);
+    let manifest = tmp.path().join("m.json");
+    let manifest = manifest.to_str().unwrap();
+
+    // Brotli can't be scanned for: asking is an error that points to `try`.
+    let out = zscan(&["scan", &input, "--formats", "brotli"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("zscan try"));
+
+    // An empty scan gives a manifest to add to; `try` adds the stream at a known offset.
+    assert!(zscan(&["scan", &input, "-o", manifest]).status.success());
+    let at = format!("{:#x}", f.expected[0].offset);
+    let tried = ok_json(&["try", &input, "--at", &at, "--format", "brotli", "-m", manifest, "--json"]);
+    assert_eq!(tried["compressed_size"], f.expected[0].compressed_size as u64);
+    assert_eq!(tried["added_as"], 0);
+    assert!(!tried["exact_params"].is_null());
+    // Trying the wrong offset fails without touching the manifest.
+    assert!(!zscan(&["try", &input, "--at", "5", "--format", "zlib", "-m", manifest]).status.success());
+
+    let out_dir = tmp.path().join("out");
+    let files = ok_json(&["extract", &input, "-m", manifest, "-d", out_dir.to_str().unwrap(), "--json"]);
+    let file = files[0]["path"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::read(&file).unwrap(), f.expected[0].payload);
+
+    std::fs::write(&file, b"a short brotli replacement").unwrap();
+    let packed = tmp.path().join("p.bin");
+    let report = ok_json(&["pack", &input, "-m", manifest, "-d", out_dir.to_str().unwrap(), "-o", packed.to_str().unwrap(), "--json"]);
+    assert_eq!(report["streams"][0]["status"], "repacked");
+}

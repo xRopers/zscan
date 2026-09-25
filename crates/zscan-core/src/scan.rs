@@ -15,9 +15,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::checksum::crc32;
-use crate::codec::{Codec, CompressionParams, DecodeCtx, Format, codec_for};
-use crate::deflater::find_params;
+use crate::codec::{Codec, DecodeCtx, DecodeError, Format, codec_for};
 use crate::entropy::shannon;
+use crate::params::EncoderParams;
 
 pub const DEFAULT_MIN_SIZE: u64 = 32;
 pub const DEFAULT_RAW_MIN_COMPRESSED: u64 = 256;
@@ -44,7 +44,8 @@ pub struct ScanOptions {
     pub formats: Vec<Format>,
     /// Minimum decompressed size, in bytes.
     pub min_size: u64,
-    /// Minimum compressed size for raw deflate.
+    /// Minimum compressed size for unverified formats. For raw deflate only bytes after
+    /// any leading stored blocks count, since stored data proves nothing.
     pub raw_min_compressed: u64,
     /// Reject raw deflate whose output entropy is above this (bits per byte).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,7 +60,8 @@ pub struct ScanOptions {
     pub max_entropy: Option<f64>,
     /// Largest decompressed size of any single stream.
     pub max_output: u64,
-    /// Search for zlib settings that reproduce each stream exactly (see [`find_params`]).
+    /// Search for encoder settings that reproduce each stream exactly
+    /// (see [`Codec::find_params`]).
     #[serde(default = "yes")]
     pub match_params: bool,
 }
@@ -75,7 +77,7 @@ fn default_raw_min_ratio() -> f64 {
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
-            formats: Format::ALL.to_vec(),
+            formats: Format::SCANNABLE.to_vec(),
             min_size: DEFAULT_MIN_SIZE,
             raw_min_compressed: DEFAULT_RAW_MIN_COMPRESSED,
             raw_max_entropy: Some(DEFAULT_RAW_MAX_ENTROPY),
@@ -97,7 +99,8 @@ pub struct FoundStream {
     pub decompressed_size: u64,
     /// CRC-32 of the decompressed data.
     pub crc32: u32,
-    pub params: CompressionParams,
+    /// Settings that reproduce the stream exactly, if the scan found any.
+    pub exact_params: Option<EncoderParams>,
     pub original_name: Option<String>,
 }
 
@@ -148,7 +151,7 @@ fn scan_chunked(data: &[u8], opts: &ScanOptions, chunk: usize) -> (Vec<FoundStre
     let mut stats = ScanStats { bytes: data.len() as u64, ..Default::default() };
     let max_output = usize::try_from(opts.max_output).unwrap_or(usize::MAX);
 
-    let mut formats = opts.formats.clone();
+    let mut formats: Vec<Format> = opts.formats.iter().copied().filter(|f| f.scannable()).collect();
     formats.sort();
     formats.dedup();
     let (verified, unverified): (Vec<&dyn Codec>, Vec<&dyn Codec>) =
@@ -253,14 +256,42 @@ fn resolve_unverified(hits: Vec<FoundStream>) -> Vec<FoundStream> {
     found
 }
 
-/// Replace the header-derived params with exact ones if some zlib setting reproduces the stream.
+/// Decode a stream of `format` starting exactly at `offset`, with no scan filters
+/// applied. This is how formats that can't be scanned for (brotli) are found, and how a
+/// front end can test a location by hand. With `match_params`, exact encoder settings
+/// are searched for as in a scan.
+pub fn decode_at(
+    data: &[u8],
+    offset: u64,
+    format: Format,
+    max_output: u64,
+    match_params: bool,
+) -> Result<FoundStream, DecodeError> {
+    let start = usize::try_from(offset).ok().filter(|&o| o < data.len()).ok_or(DecodeError::Truncated)?;
+    let mut ctx = DecodeCtx::new(usize::try_from(max_output).unwrap_or(usize::MAX));
+    let decoded = codec_for(format).decode(&data[start..], &mut ctx)?;
+    let mut found = FoundStream {
+        offset,
+        format,
+        compressed_size: decoded.compressed_size as u64,
+        decompressed_size: decoded.data.len() as u64,
+        crc32: crc32(&decoded.data),
+        exact_params: None,
+        original_name: decoded.original_name.clone(),
+    };
+    if match_params {
+        let stream = &data[start..start + decoded.compressed_size];
+        found.exact_params = codec_for(format).find_params(stream, &decoded);
+    }
+    Ok(found)
+}
+
+/// Record settings that reproduce the stream exactly, if the codec can find any.
 fn match_params(data: &[u8], found: &mut FoundStream, ctx: &mut DecodeCtx) {
     let start = found.offset as usize;
     let stream = &data[start..start + found.compressed_size as usize];
     let Ok(decoded) = codec_for(found.format).decode(stream, ctx) else { return };
-    if let Some(p) = find_params(&decoded.data, &stream[decoded.body.clone()], found.params.window_bits) {
-        found.params = CompressionParams::exact(p);
-    }
+    found.exact_params = codec_for(found.format).find_params(stream, &decoded);
 }
 
 /// The first codec whose stream at `pos` decodes and passes the filters.
@@ -279,13 +310,14 @@ fn try_at(
         }
         let Ok(decoded) = codec.decode(window, ctx) else { continue };
         let format = codec.format();
-        let result = accept(format, decoded.compressed_size, &decoded.data, opts).then(|| FoundStream {
+        let stream = &window[..decoded.compressed_size];
+        let result = accept(*codec, stream, &decoded.data, opts).then(|| FoundStream {
             offset: pos as u64,
             format,
             compressed_size: decoded.compressed_size as u64,
             decompressed_size: decoded.data.len() as u64,
             crc32: crc32(&decoded.data),
-            params: decoded.params.clone(),
+            exact_params: None,
             original_name: decoded.original_name.clone(),
         });
         if result.is_some() {
@@ -295,13 +327,14 @@ fn try_at(
     None
 }
 
-fn accept(format: Format, compressed_size: usize, out: &[u8], opts: &ScanOptions) -> bool {
+fn accept(codec: &dyn Codec, stream: &[u8], out: &[u8], opts: &ScanOptions) -> bool {
+    let compressed_size = stream.len();
     if (out.len() as u64) < opts.min_size || (out.len() as f64) < opts.min_ratio * compressed_size as f64 {
         return false;
     }
     let mut max_entropy = opts.max_entropy;
-    if !codec_for(format).self_verifying() {
-        if (compressed_size as u64) < opts.raw_min_compressed
+    if !codec.self_verifying() {
+        if (codec.evidence(stream) as u64) < opts.raw_min_compressed
             || (out.len() as f64) < opts.raw_min_ratio * compressed_size as f64
         {
             return false;

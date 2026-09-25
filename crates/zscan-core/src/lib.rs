@@ -15,12 +15,13 @@ pub mod extract;
 pub mod input;
 pub mod manifest;
 pub mod pack;
+pub mod params;
 pub mod scan;
 
-pub use codec::{Codec, CompressionParams, DecodeCtx, DecodeError, Decoded, Format, Strategy, codec_for};
-pub use deflater::DeflateParams;
+pub use codec::{Codec, DecodeCtx, DecodeError, Decoded, Format, codec_for};
+pub use params::{DeflateParams, EncoderParams, Strategy};
 pub use error::{Error, Result};
 pub use extract::{ExtractOptions, ExtractedFile, decode_stream, extract_all};
 pub use manifest::{Manifest, SourceInfo, StreamEntry};
 pub use pack::{Outcome, PackOptions, PackResult, StreamPlan, load_edits, pack};
-pub use scan::{FoundStream, ScanOptions, ScanStats, scan, scan_with_stats};
+pub use scan::{FoundStream, ScanOptions, ScanStats, decode_at, scan, scan_with_stats};

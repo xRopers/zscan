@@ -27,6 +27,8 @@ pub fn format_color(format: Format) -> Color32 {
         Format::Bzip2 => Color32::from_rgb(170, 200, 80),
         Format::Lz4 => Color32::from_rgb(240, 220, 90),
         Format::Brotli => Color32::from_rgb(200, 120, 90),
+        Format::Lzo => Color32::from_rgb(120, 210, 120),
+        Format::Oodle => Color32::from_rgb(210, 170, 255),
     }
 }
 

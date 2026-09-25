@@ -11,8 +11,8 @@ use zscan_core::codec::codec_for;
 use zscan_core::content::sniff;
 use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_RAW_MAX_ENTROPY};
 use zscan_core::{
-    DecodeCtx, ExtractOptions, Format, Manifest, Outcome, PackOptions, Progress, ScanOptions, StreamEntry, decode_at,
-    extract_all, load_edits, rebuild_file, unpack,
+    DecodeCtx, ExtractOptions, Format, Manifest, Outcome, PackOptions, Progress, ScanOptions, SizeHint, StreamEntry,
+    decode_at, extract_all, load_edits, rebuild_file, unpack,
 };
 
 use crate::jobs::{Jobs, finish};
@@ -56,6 +56,8 @@ pub enum Action {
 struct TryAt {
     offset: String,
     format: Format,
+    /// Decompressed size, if known; Oodle needs it.
+    size: String,
     match_params: bool,
 }
 
@@ -107,7 +109,7 @@ impl App {
             show_try: false,
             show_pack: false,
             show_log: false,
-            try_at: TryAt { offset: String::new(), format: Format::Brotli, match_params: true },
+            try_at: TryAt { offset: String::new(), format: Format::Brotli, size: String::new(), match_params: true },
             pack_ui: PackUi { use_slack: false, relocate: false, align: 1, save_manifest: false },
             confirm: None,
             allow_close: false,
@@ -200,15 +202,25 @@ impl App {
             self.session.error(format!("'{}' is not an offset (decimal, or hex with 0x)", self.try_at.offset));
             return;
         };
+        let size = self.try_at.size.trim();
+        let hint = match parse_offset(size) {
+            _ if size.is_empty() => SizeHint::default(),
+            Some(n) => SizeHint { compressed: None, decompressed: usize::try_from(n).ok() },
+            None => {
+                self.session.error(format!("'{size}' is not a size (decimal, or hex with 0x)"));
+                return;
+            }
+        };
         let (data, format, match_params) = (file.data.clone(), self.try_at.format, self.try_at.match_params);
         self.jobs.start(format!("Decoding {format} at {offset:#x}"), None, move || {
-            let result = decode_at(&data, offset, format, DEFAULT_MAX_OUTPUT, match_params)
+            let result = decode_at(&data, offset, format, hint, DEFAULT_MAX_OUTPUT, match_params)
                 .map_err(|e| anyhow::anyhow!("no {format} stream decodes at {offset:#x}: {e}"))
                 .map(|found| {
                     let mut ctx = DecodeCtx::new(found.decompressed_size as usize);
+                    let hint = SizeHint::exact(found.compressed_size as usize, found.decompressed_size as usize);
                     let content = codec_for(format)
-                        .decode(&data[offset as usize..], &mut ctx)
                         .ok()
+                        .and_then(|c| c.decode_with_hint(&data[offset as usize..], hint, &mut ctx).ok())
                         .map(|d| sniff(&d.data[..d.data.len().min(4096)]));
                     (found, content)
                 });
@@ -1157,6 +1169,9 @@ impl App {
                         ui.selectable_value(&mut self.try_at.format, f, f.name());
                     }
                 });
+                ui.end_row();
+                ui.label("Decompressed size");
+                ui.add(egui::TextEdit::singleline(&mut self.try_at.size).hint_text("optional; Oodle needs it"));
                 ui.end_row();
             });
             ui.checkbox(&mut self.try_at.match_params, "Find exact encoder settings");

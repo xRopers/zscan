@@ -9,7 +9,11 @@ use serde_json::json;
 fn main() -> std::io::Result<()> {
     let dir = std::env::args().nth(1).map_or_else(|| PathBuf::from("tests/fixtures"), PathBuf::from);
     fs::create_dir_all(&dir)?;
-    for fixture in zscan_fixtures::all().into_iter().chain([zscan_fixtures::brotli_streams()]) {
+    let mut fixtures = zscan_fixtures::all();
+    fixtures.push(zscan_fixtures::brotli_streams());
+    #[cfg(feature = "lzo")]
+    fixtures.push(zscan_fixtures::lzo_streams());
+    for fixture in fixtures {
         let streams: Vec<_> = fixture
             .expected
             .iter()

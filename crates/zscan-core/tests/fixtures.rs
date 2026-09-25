@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use zscan_core::{
-    DecodeCtx, Error, ExtractOptions, Format, Manifest, ScanOptions, SourceInfo, codec_for, decode_stream, extract_all,
-    scan,
+    DecodeCtx, Error, ExtractOptions, Format, Manifest, ScanOptions, SizeHint, SourceInfo, codec_for, decode_stream,
+    extract_all, scan,
 };
 use zscan_fixtures::{Fixture, Kind};
 
@@ -48,9 +48,9 @@ fn matched_params_rebuild_reproducible_streams_exactly() {
             assert_eq!(s.exact_params.is_some(), e.reproducible, "{what}");
             let Some(params) = &s.exact_params else { continue };
             let original = &f.data[e.offset..e.offset + e.compressed_size];
-            let codec = codec_for(s.format);
+            let codec = codec_for(s.format).unwrap();
             let decoded = codec.decode(original, &mut ctx).unwrap();
-            let rebuilt = codec.encode(original, &decoded, &e.payload, params);
+            let rebuilt = codec.encode(original, &decoded, &e.payload, params).unwrap();
             assert!(rebuilt == original, "{what}: {params} does not rebuild it");
         }
     }
@@ -254,15 +254,16 @@ fn brotli_is_never_scanned_but_decodes_at_known_offsets() {
     assert!(scan(&f.data, &opts).is_empty(), "brotli is ignored even when asked for");
 
     let found: Vec<_> =
-        f.expected.iter().map(|e| zscan_core::decode_at(&f.data, e.offset as u64, Format::Brotli, 1 << 30, true).unwrap()).collect();
+        f.expected.iter().map(|e| zscan_core::decode_at(&f.data, e.offset as u64, Format::Brotli, SizeHint::default(), 1 << 30, true).unwrap()).collect();
     let rows: Vec<Row> = found.iter().map(|s| (s.offset, s.format.name(), s.compressed_size, s.decompressed_size, s.crc32)).collect();
     assert_eq!(rows, expected_rows(&f));
     let mut ctx = DecodeCtx::new(1 << 24);
     for (s, e) in found.iter().zip(&f.expected) {
         let params = s.exact_params.as_ref().unwrap_or_else(|| panic!("no exact params for brotli at {:#x}", e.offset));
         let original = &f.data[e.offset..e.offset + e.compressed_size];
-        let decoded = codec_for(Format::Brotli).decode(original, &mut ctx).unwrap();
-        assert!(codec_for(Format::Brotli).encode(original, &decoded, &e.payload, params) == original);
+        let codec = codec_for(Format::Brotli).unwrap();
+        let decoded = codec.decode(original, &mut ctx).unwrap();
+        assert!(codec.encode(original, &decoded, &e.payload, params).unwrap() == original);
     }
 }
 
@@ -272,7 +273,7 @@ fn decode_at_and_add_stream() {
     let mut manifest = manifest_for(&f);
     // Drop a scanned stream and add it back by hand.
     let removed = manifest.streams.remove(2);
-    let found = zscan_core::decode_at(&f.data, removed.offset, Format::Zlib, 1 << 30, true).unwrap();
+    let found = zscan_core::decode_at(&f.data, removed.offset, Format::Zlib, SizeHint::default(), 1 << 30, true).unwrap();
     assert_eq!((found.compressed_size, found.crc32), (removed.compressed_size, removed.crc32));
     assert_eq!(found.exact_params, removed.exact_params);
     let id = manifest.add_stream(found.clone()).unwrap();
@@ -280,8 +281,14 @@ fn decode_at_and_add_stream() {
     assert_eq!(manifest.streams[2].offset, removed.offset, "kept in offset order");
     assert!(matches!(manifest.add_stream(found), Err(Error::InvalidManifest(_))), "overlap rejected");
     // Wrong format or offset fails cleanly.
-    assert!(zscan_core::decode_at(&f.data, removed.offset + 1, Format::Zlib, 1 << 30, false).is_err());
-    assert!(zscan_core::decode_at(&f.data, u64::MAX, Format::Zlib, 1 << 30, false).is_err());
+    assert!(zscan_core::decode_at(&f.data, removed.offset + 1, Format::Zlib, SizeHint::default(), 1 << 30, false).is_err());
+    assert!(zscan_core::decode_at(&f.data, u64::MAX, Format::Zlib, SizeHint::default(), 1 << 30, false).is_err());
+    // Sizes given with the offset must match what decodes there.
+    let wrong = SizeHint { compressed: None, decompressed: Some(removed.decompressed_size as usize + 1) };
+    assert!(matches!(
+        zscan_core::decode_at(&f.data, removed.offset, Format::Zlib, wrong, 1 << 30, false),
+        Err(zscan_core::DecodeError::SizeMismatch { .. })
+    ));
 }
 
 #[test]
@@ -291,5 +298,26 @@ fn every_format_parses_by_name() {
         assert_eq!(serde_json::to_string(&f).unwrap(), format!("\"{}\"", f.name()));
     }
     assert!(!Format::SCANNABLE.contains(&Format::Brotli));
-    assert!(Format::SCANNABLE.iter().all(|f| f.scannable()));
+    assert!(Format::SCANNABLE.iter().all(|f| f.scannable() && f.available().is_ok()));
+    assert!(!Format::SCANNABLE.contains(&Format::Lzo) && !Format::SCANNABLE.contains(&Format::Oodle), "opt-in only");
+}
+
+#[test]
+fn plugin_formats_without_their_feature_say_how_to_get_them() {
+    let manifest_text = |format: &str| {
+        let m = manifest_for(&zscan_fixtures::zlib_basic());
+        m.to_json().replacen("\"format\": \"zlib\"", &format!("\"format\": \"{format}\""), 1)
+    };
+    for (format, enabled) in [(Format::Lzo, cfg!(feature = "lzo")), (Format::Oodle, cfg!(feature = "oodle"))] {
+        // Manifests naming the format always parse.
+        let m = Manifest::from_json(&manifest_text(format.name())).unwrap();
+        assert_eq!(m.streams[0].format, format);
+        if !enabled {
+            let err = format.available().unwrap_err().to_string();
+            assert!(err.contains(&format!("--features {format}")), "{err}");
+            let mut ctx = DecodeCtx::new(1 << 20);
+            let err = decode_stream(&zscan_fixtures::zlib_basic().data, &m.streams[0], &mut ctx).unwrap_err().to_string();
+            assert!(err.contains("built without"), "{err}");
+        }
+    }
 }

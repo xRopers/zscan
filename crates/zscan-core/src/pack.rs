@@ -27,7 +27,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::checksum::crc32;
-use crate::codec::{Codec, DecodeCtx, Decoded, Format, codec_for};
+use crate::codec::{Codec, DecodeCtx, Decoded, Format, SizeHint, codec_for};
 use crate::error::{Error, Result, io_err};
 use crate::extract::decode_stream;
 use crate::fields::{check_fields, measure, measure_name};
@@ -399,14 +399,15 @@ fn plan_stream(
     let slack = if opts.use_zero_slack { data[end..next_start].iter().take_while(|&&b| b == 0).count() } else { 0 };
     let available = end - start + slack;
 
-    let codec = codec_for(entry.format);
+    let codec = codec_for(entry.format)?;
     let first = match &entry.exact_params {
         Some(p) => codec
             .adapt_params(old_stream, &original, p)
             .map_err(|e| Error::InvalidManifest(format!("stream {}: {e}", entry.id)))?,
         None => codec.default_params(old_stream, &original),
     };
-    let (stream, params) = fit(codec, old_stream, &original, new_data, &first, available);
+    let (stream, params) = fit(codec, old_stream, &original, new_data, &first, available)
+        .map_err(|e| Error::Stream { id: entry.id, offset: entry.offset, reason: e })?;
     let relocatable = can_relocate(entry);
     let relocate = stream.len() > available;
     if relocate && !(opts.relocate && relocatable) {
@@ -416,7 +417,9 @@ fn plan_stream(
 
     // The new stream must decode, alone, to exactly the edited data.
     let fail = |reason: String| Error::Verify { id: entry.id, offset: entry.offset, reason };
-    let decoded = codec.decode(&stream, ctx).map_err(|e| fail(format!("{} decode failed: {e}", entry.format)))?;
+    let hint = SizeHint::exact(stream.len(), new_data.len());
+    let decoded =
+        codec.decode_with_hint(&stream, hint, ctx).map_err(|e| fail(format!("{} decode failed: {e}", entry.format)))?;
     if decoded.compressed_size != stream.len() || decoded.data != *new_data {
         return Err(fail("re-encoded stream does not decode to the edited data".into()));
     }
@@ -469,19 +472,19 @@ fn fit(
     data: &[u8],
     first: &EncoderParams,
     available: usize,
-) -> (Vec<u8>, EncoderParams) {
+) -> std::result::Result<(Vec<u8>, EncoderParams), String> {
     let build = |p: &EncoderParams| codec.encode(old_stream, original, data, p);
-    let mut best = (build(first), first.clone());
+    let mut best = (build(first)?, first.clone());
     if best.0.len() <= available {
-        return best;
+        return Ok(best);
     }
     for p in codec.stronger_params(first) {
-        let stream = build(&p);
+        let stream = build(&p)?;
         if stream.len() < best.0.len() {
             best = (stream, p);
         }
     }
-    best
+    Ok(best)
 }
 
 fn packed_manifest(original: &Manifest, plans: &[StreamPlan], edits: &BTreeMap<u32, Vec<u8>>) -> Manifest {

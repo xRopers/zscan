@@ -19,10 +19,12 @@ pub mod manifest;
 pub mod output;
 pub mod pack;
 pub mod params;
+pub mod plugins;
 pub mod scan;
 pub mod unpack;
 
-pub use codec::{Codec, DecodeCtx, DecodeError, Decoded, Format, codec_for};
+pub use codec::{Codec, DecodeCtx, DecodeError, Decoded, Format, SizeHint, codec_for};
+pub use plugins::{Unavailable, set_oodle_dll};
 pub use params::{DeflateParams, EncoderParams, Strategy};
 pub use error::{Error, Result};
 pub use extract::{ExtractOptions, ExtractedFile, decode_stream, extract_all};

@@ -17,6 +17,8 @@ clap = { version = "4", features = ["derive"] }
 crc32fast = "1.4"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 lz4_flex = "0.14"
+libloading = "0.8"
+lzo1x = "0.2"
 libz-sys = { version = "1.1", default-features = false, features = ["static"] }
 memmap2 = "0.9"
 rayon = "1"

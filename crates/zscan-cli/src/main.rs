@@ -7,9 +7,9 @@ use serde::Serialize;
 use zscan_core::entropy::{entropy_map, shannon};
 use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_MIN_SIZE, DEFAULT_RAW_MAX_ENTROPY, DEFAULT_RAW_MIN_COMPRESSED, DEFAULT_RAW_MIN_RATIO};
 use zscan_core::{
-    DetectOptions, ExtractOptions, FieldCandidate, FieldUpdate, Format, Manifest, Outcome, PackOptions,
-    ScanOptions, apply_unambiguous, check_fields, detect_fields, rebuild_file, unpack, ScanStats, SourceInfo, StreamEntry,
-    StreamPlan, decode_at, extract_all, input, load_edits, pack, scan, scan_with_stats,
+    DecodeError, DetectOptions, Endian, ExtractOptions, FieldCandidate, FieldUpdate, Format, LengthField, Manifest, Measures, Outcome,
+    PackOptions, ScanOptions, SizeHint, apply_unambiguous, check_fields, detect_fields, rebuild_file, unpack, ScanStats,
+    SourceInfo, StreamEntry, StreamPlan, decode_at, extract_all, input, load_edits, pack, scan, scan_with_stats,
 };
 
 #[derive(Parser)]
@@ -22,6 +22,11 @@ struct Cli {
     /// Worker threads [default: one per CPU]
     #[arg(short = 'j', long, global = true, value_name = "N")]
     threads: Option<usize>,
+
+    /// Your own Oodle library (oo2core_*.dll or liboo2core*.so), for Oodle streams in a
+    /// build with the `oodle` feature [default: $ZSCAN_OODLE_DLL]. zscan doesn't include Oodle
+    #[arg(long, global = true, value_name = "PATH")]
+    oodle_dll: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -132,7 +137,8 @@ enum Command {
         output: PathBuf,
     },
     /// Try decoding one format at an exact offset, and optionally add the stream to a
-    /// manifest. For formats that can't be scanned for (brotli), or to check a location
+    /// manifest. For formats that can't be scanned for (brotli) or need their size given
+    /// (oodle), or to check a location
     Try {
         file: PathBuf,
         /// Offset of the stream start (decimal, or hex with 0x)
@@ -141,6 +147,15 @@ enum Command {
         /// Format to decode as
         #[arg(long)]
         format: Format,
+        /// Decompressed size: a number, or @OFFSET[:TYPE] to read it from a field in the
+        /// file (TYPE u8, u16le, u16be, u32le [default], u32be, u64le or u64be). Oodle
+        /// needs this. A field is added to the manifest as a length field
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        decompressed_size: Option<SizeArg>,
+        /// Compressed size, the same way. Oodle streams from the LZNA and BitKnit
+        /// compressors need this too
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        compressed_size: Option<SizeArg>,
         /// Add the stream to this manifest (it must describe the same file)
         #[arg(short, long)]
         manifest: Option<PathBuf>,
@@ -162,10 +177,17 @@ enum Command {
 #[derive(Args)]
 struct ScanArgs {
     /// Formats to look for, comma separated [default: gzip, zlib, zstd, xz, bzip2, lz4,
-    /// deflate]. Brotli can't be scanned for; use `zscan try --format brotli`
+    /// deflate]. lzo can be added in a build with the `lzo` feature; it is found only where
+    /// a field in the 16 bytes before the stream holds its compressed size. Brotli can't
+    /// be scanned for; use `zscan try --format brotli`
     #[arg(long, value_delimiter = ',', default_values_t = Format::SCANNABLE.to_vec(), hide_default_value = true,
           value_parser = parse_scannable)]
     formats: Vec<Format>,
+    /// Also look for Oodle streams (needs the `oodle` feature and --oodle-dll). Oodle has
+    /// no size or end marker, so a candidate is only decoded with sizes read from integer
+    /// fields in the 16 bytes before it; for other layouts use `zscan try`
+    #[arg(long)]
+    scan_oodle: bool,
     /// Minimum decompressed size in bytes
     #[arg(long, default_value_t = DEFAULT_MIN_SIZE)]
     min_size: u64,
@@ -195,9 +217,14 @@ struct ScanArgs {
 }
 
 impl ScanArgs {
-    fn options(&self) -> ScanOptions {
-        ScanOptions {
-            formats: self.formats.clone(),
+    /// The scan options, checked against what this build and the Oodle library support.
+    fn options(&self) -> Result<ScanOptions> {
+        let mut formats = self.formats.clone();
+        if self.scan_oodle && !formats.contains(&Format::Oodle) {
+            formats.push(Format::Oodle);
+        }
+        let opts = ScanOptions {
+            formats,
             min_size: self.min_size,
             raw_min_compressed: self.raw_min_compressed,
             raw_max_entropy: (self.raw_max_entropy < 8.0).then_some(self.raw_max_entropy),
@@ -206,7 +233,9 @@ impl ScanArgs {
             max_entropy: self.max_entropy,
             max_output: self.max_output,
             match_params: !self.no_match,
-        }
+        };
+        opts.check_formats()?;
+        Ok(opts)
     }
 }
 
@@ -224,6 +253,9 @@ fn run(cli: Cli) -> Result<()> {
     if let Some(n) = cli.threads {
         rayon::ThreadPoolBuilder::new().num_threads(n.max(1)).build_global()?;
     }
+    if cli.oodle_dll.is_some() {
+        zscan_core::set_oodle_dll(cli.oodle_dll);
+    }
     match cli.command {
         Command::Scan { file, output, stats, filters } => cmd_scan(&file, output.as_deref(), stats, &filters, cli.json),
         Command::Extract { file, manifest, dir, force, filters } => {
@@ -239,8 +271,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::Fields { file, manifest, window, min_value, apply } => {
             cmd_fields(&file, &manifest, &DetectOptions { window, min_global_value: min_value }, apply, cli.json)
         }
-        Command::Try { file, at, format, manifest, no_match } => {
-            cmd_try(&file, at, format, manifest.as_deref(), !no_match, cli.json)
+        Command::Try { file, at, format, decompressed_size, compressed_size, manifest, no_match } => {
+            let sizes = [(Measures::Compressed, compressed_size), (Measures::Decompressed, decompressed_size)];
+            cmd_try(&file, at, format, &sizes, manifest.as_deref(), !no_match, cli.json)
         }
         Command::Info { file, blocks, filters } => cmd_info(&file, blocks, &filters, cli.json),
     }
@@ -253,7 +286,7 @@ fn build_manifest(file: &Path, data: &[u8], opts: ScanOptions) -> Manifest {
 
 fn cmd_scan(file: &Path, output: Option<&Path>, stats: bool, filters: &ScanArgs, json: bool) -> Result<()> {
     let data = input::open(file)?;
-    let opts = filters.options();
+    let opts = filters.options()?;
     let (found, scan_stats) = scan_with_stats(&data, &opts);
     let manifest = Manifest::new(SourceInfo::describe(file, &data), opts, found);
     if stats {
@@ -289,7 +322,7 @@ fn cmd_extract(
     let manifest = match manifest {
         Some(path) => Manifest::load(path)?,
         // Params only matter for packing, which needs a saved manifest anyway.
-        None => build_manifest(file, &data, ScanOptions { match_params: false, ..filters.options() }),
+        None => build_manifest(file, &data, ScanOptions { match_params: false, ..filters.options()? }),
     };
     let files = extract_all(&data, &manifest, dir, &ExtractOptions { verify_source: !force })?;
     if json {
@@ -321,7 +354,7 @@ fn cmd_info(file: &Path, blocks: usize, filters: &ScanArgs, json: bool) -> Resul
     // Entropy of an n-byte block can't exceed log2(n), so tiny blocks all look alike.
     const MIN_BLOCK: usize = 256;
     let map = entropy_map(&data, blocks.min(data.len().div_ceil(MIN_BLOCK)));
-    let found = scan(&data, &ScanOptions { match_params: false, ..filters.options() });
+    let found = scan(&data, &ScanOptions { match_params: false, ..filters.options()? });
     let report = InfoReport {
         file: file.display().to_string(),
         size: data.len() as u64,
@@ -539,7 +572,7 @@ fn cmd_unpack(file: &Path, dir: &Path, manifest: Option<&Path>, filters: &ScanAr
     let data = input::open(file)?;
     let manifest = match manifest {
         Some(path) => Manifest::load(path)?,
-        None => build_manifest(file, &data, filters.options()),
+        None => build_manifest(file, &data, filters.options()?),
     };
     let summary = unpack(&data, &manifest, dir)?;
     if json {
@@ -638,15 +671,77 @@ fn parse_scannable(s: &str) -> Result<Format, String> {
     Ok(format)
 }
 
-fn cmd_try(file: &Path, at: u64, format: Format, manifest_path: Option<&Path>, match_params: bool, json: bool) -> Result<()> {
+/// A size from the command line: a number, or a field in the file that holds it.
+#[derive(Debug, Clone, Copy)]
+enum SizeArg {
+    Value(u64),
+    Field { offset: u64, width: u8, endian: Endian },
+}
+
+fn parse_size(s: &str) -> Result<SizeArg, String> {
+    let Some(field) = s.strip_prefix('@') else {
+        return s.parse().map(SizeArg::Value).map_err(|e| format!("invalid size '{s}': {e}"));
+    };
+    let (offset, kind) = field.split_once(':').unwrap_or((field, "u32le"));
+    let (width, endian) = match kind.to_ascii_lowercase().as_str() {
+        "u8" => (1, Endian::Little),
+        "u16le" => (2, Endian::Little),
+        "u16be" => (2, Endian::Big),
+        "u32le" => (4, Endian::Little),
+        "u32be" => (4, Endian::Big),
+        "u64le" => (8, Endian::Little),
+        "u64be" => (8, Endian::Big),
+        other => return Err(format!("unknown field type '{other}' (expected u8, u16le, u16be, u32le, u32be, u64le or u64be)")),
+    };
+    Ok(SizeArg::Field { offset: parse_offset(offset)?, width, endian })
+}
+
+fn cmd_try(
+    file: &Path,
+    at: u64,
+    format: Format,
+    sizes: &[(Measures, Option<SizeArg>)],
+    manifest_path: Option<&Path>,
+    match_params: bool,
+    json: bool,
+) -> Result<()> {
     let data = input::open(file)?;
-    let found = decode_at(&data, at, format, DEFAULT_MAX_OUTPUT, match_params)
-        .map_err(|e| anyhow::anyhow!("no {format} stream decodes at {at:#x}: {e}"))?;
+    format.available()?;
+    let mut hint = SizeHint::default();
+    let mut fields = Vec::new();
+    for &(measures, size) in sizes {
+        let value = match size {
+            None => continue,
+            Some(SizeArg::Value(v)) => v,
+            Some(SizeArg::Field { offset, width, endian }) => {
+                let field = LengthField { offset, width, endian, measures, adjust: 0 };
+                let v = field.read(&data).ok_or_else(|| anyhow::anyhow!("size field at {offset:#x} is past the end of the file"))?;
+                fields.push(field);
+                v
+            }
+        };
+        let value = usize::try_from(value)?;
+        match measures {
+            Measures::Compressed => hint.compressed = Some(value),
+            _ => hint.decompressed = Some(value),
+        }
+    }
+    let found = decode_at(&data, at, format, hint, DEFAULT_MAX_OUTPUT, match_params).map_err(|e| {
+        let flag = match e {
+            DecodeError::SizeRequired(which) => format!("; pass --{which}-size N, or @OFFSET to read it from the file"),
+            _ => String::new(),
+        };
+        anyhow::anyhow!("no {format} stream decodes at {at:#x}: {e}{flag}")
+    })?;
     let mut added = None;
     if let Some(path) = manifest_path {
         let mut manifest = Manifest::load(path)?;
         manifest.source.check(&data)?;
-        added = Some(manifest.add_stream(found.clone())?);
+        let id = manifest.add_stream(found.clone())?;
+        let entry = manifest.streams.iter_mut().find(|s| s.id == id).expect("just added");
+        entry.length_fields.extend(fields);
+        check_fields(&data, &manifest)?;
+        added = Some(id);
         manifest.save(path)?;
     }
     if json {

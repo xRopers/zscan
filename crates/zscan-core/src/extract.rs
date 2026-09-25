@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::checksum::crc32;
-use crate::codec::{DecodeCtx, Decoded, codec_for};
+use crate::codec::{DecodeCtx, Decoded, SizeHint, codec_for};
 use crate::error::{Error, Result, io_err};
 use crate::manifest::{Manifest, StreamEntry, is_safe_filename};
 
@@ -32,15 +32,20 @@ pub struct ExtractedFile {
 }
 
 /// Decode one manifest stream from `data` and check it against the manifest's
-/// sizes and checksum.
+/// sizes and checksum. The sizes are also the decoder's hint, which is what lets formats
+/// that don't record their own size (Oodle) round-trip.
 pub fn decode_stream(data: &[u8], entry: &StreamEntry, ctx: &mut DecodeCtx) -> Result<Decoded> {
     let fail = |reason: String| Error::Stream { id: entry.id, offset: entry.offset, reason };
     let start = usize::try_from(entry.offset)
         .ok()
         .filter(|&o| o <= data.len())
         .ok_or_else(|| fail("offset is past the end of the input".into()))?;
-    let decoded = codec_for(entry.format)
-        .decode(&data[start..], ctx)
+    let hint = SizeHint {
+        compressed: usize::try_from(entry.compressed_size).ok(),
+        decompressed: usize::try_from(entry.decompressed_size).ok(),
+    };
+    let decoded = codec_for(entry.format)?
+        .decode_with_hint(&data[start..], hint, ctx)
         .map_err(|e| fail(format!("{} decode failed: {e}", entry.format)))?;
     if decoded.compressed_size as u64 != entry.compressed_size {
         return Err(fail(format!(

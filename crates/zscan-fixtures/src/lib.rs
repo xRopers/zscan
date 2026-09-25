@@ -23,6 +23,7 @@ pub enum Kind {
     Lz4,
     Deflate,
     Brotli,
+    Lzo,
 }
 
 impl Kind {
@@ -37,6 +38,7 @@ impl Kind {
             Kind::Lz4 => "lz4",
             Kind::Deflate => "deflate",
             Kind::Brotli => "brotli",
+            Kind::Lzo => "lzo",
         }
     }
 }
@@ -413,6 +415,31 @@ pub fn brotli_streams() -> Fixture {
     b.stream(Kind::Brotli, brotli(&p, 5, 18), p, None);
     b.random(1000);
     b.finish("brotli", "brotli streams (quality 11 and 5) in random filler; scan with brotli enabled")
+}
+
+/// Raw LZO1X from the `lzo1x` crate (liblzo's compressors). `level` is that crate's:
+/// 1-4 LZO1X-1 (3 is minilzo's `lzo1x_1`), 5-13 LZO1X-999 levels 1-9.
+#[cfg(feature = "lzo")]
+pub fn lzo(payload: &[u8], level: u8) -> Vec<u8> {
+    lzo1x::compress(payload, lzo1x::CompressLevel::new(level))
+}
+
+/// Raw LZO1X streams laid out like a game archive: each is preceded by its decompressed
+/// and compressed sizes as little-endian u32s, with random filler between records. Raw
+/// LZO has no magic, so these are only scanned for when asked.
+#[cfg(feature = "lzo")]
+pub fn lzo_streams() -> Fixture {
+    let mut b = Builder::new(7);
+    b.random(700);
+    let payloads = [b.text(20_000), b.records(9000), b.text(3000), b.records(40_000), b.text(5000)];
+    for (i, (p, level)) in payloads.into_iter().zip([3, 12, 1, 13, 7]).enumerate() {
+        let encoded = lzo(&p, level);
+        b.raw(&(p.len() as u32).to_le_bytes());
+        b.raw(&(encoded.len() as u32).to_le_bytes());
+        b.stream(Kind::Lzo, encoded, p, None);
+        b.random(300 + i * 111);
+    }
+    b.finish("lzo", "raw LZO1X streams (LZO1X-1 and -999) behind u32 size fields, in random filler; scan with lzo enabled")
 }
 
 pub fn zlib_basic() -> Fixture {

@@ -1,0 +1,33 @@
+{
+  "description": "toy archive: directory of offset/csize/dsize per stream",
+  "size": 110872,
+  "streams": [
+    {
+      "compressed_size": 13039,
+      "crc32": "e0e4ea35",
+      "decompressed_size": 70000,
+      "format": "zlib",
+      "offset": 81980,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 5425,
+      "crc32": "aee0603d",
+      "decompressed_size": 20000,
+      "format": "zstd",
+      "offset": 98088,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 1222,
+      "crc32": "840bc49e",
+      "decompressed_size": 5000,
+      "format": "zlib",
+      "offset": 106584,
+      "original_name": null,
+      "reproducible": true
+    }
+  ]
+}

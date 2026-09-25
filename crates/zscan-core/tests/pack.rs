@@ -144,7 +144,7 @@ fn too_large_is_reported_with_the_overflow() {
     let failures: Vec<_> = result.failures().collect();
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].id, 2);
-    let Outcome::TooLarge { best_size, available } = failures[0].outcome else { panic!() };
+    let Outcome::TooLarge { best_size, available, .. } = failures[0].outcome else { panic!() };
     assert_eq!(available, manifest.streams[2].compressed_size);
     assert!(best_size > 20_000);
     // The stream that did fit is still reported, for dry-run output.

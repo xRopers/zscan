@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codecs::{BrotliCodec, Bzip2Codec, DeflateCodec, GzipCodec, Lz4Codec, XzCodec, ZlibCodec, ZstdCodec};
 use crate::params::EncoderParams;
+use crate::plugins::Unavailable;
 
 /// Compressed stream formats. Declaration order is scan priority: when two formats
 /// match at the same offset, the earlier (better verified) one wins.
@@ -34,10 +35,18 @@ pub enum Format {
     /// readily, so it is never scanned for: decode it at a known offset with
     /// [`decode_at`](crate::scan::decode_at).
     Brotli,
+    /// Raw LZO1X (cargo feature `lzo`). No header or checksum, only an end marker, and the
+    /// start is ambiguous, so it is scanned for only when asked, and only where a field
+    /// just before the stream holds its compressed size.
+    Lzo,
+    /// Oodle Kraken, Mermaid, Selkie, Leviathan or Hydra (cargo feature `oodle`), decoded
+    /// by the user's own oo2core library. Decoding needs the decompressed size, so it is
+    /// scanned for only when asked, with sizes read from fields just before each candidate.
+    Oodle,
 }
 
 impl Format {
-    pub const ALL: [Format; 8] = [
+    pub const ALL: [Format; 10] = [
         Format::Gzip,
         Format::Zlib,
         Format::Zstd,
@@ -46,9 +55,12 @@ impl Format {
         Format::Lz4,
         Format::Deflate,
         Format::Brotli,
+        Format::Lzo,
+        Format::Oodle,
     ];
 
-    /// Every format a scan can look for (all but brotli), and the default.
+    /// The formats a scan looks for by default. LZO and Oodle can be scanned for too, when
+    /// asked; brotli never is (see [`Format::scannable`]).
     pub const SCANNABLE: [Format; 7] =
         [Format::Gzip, Format::Zlib, Format::Zstd, Format::Xz, Format::Bzip2, Format::Lz4, Format::Deflate];
 
@@ -57,9 +69,15 @@ impl Format {
         matches!(self, Format::Gzip | Format::Zlib | Format::Deflate)
     }
 
-    /// Whether blind scanning for this format gives trustworthy results.
+    /// Whether a scan may look for this format at all. Brotli can't be scanned for: random
+    /// bytes decode as brotli too readily.
     pub fn scannable(self) -> bool {
         self != Format::Brotli
+    }
+
+    /// Whether this build (and for Oodle, the configured library) can handle the format.
+    pub fn available(self) -> Result<(), Unavailable> {
+        codec_for(self).map(|_| ())
     }
 
     pub fn name(self) -> &'static str {
@@ -72,6 +90,8 @@ impl Format {
             Format::Lz4 => "lz4",
             Format::Deflate => "deflate",
             Format::Brotli => "brotli",
+            Format::Lzo => "lzo",
+            Format::Oodle => "oodle",
         }
     }
 }
@@ -95,8 +115,10 @@ impl FromStr for Format {
             "lz4" => Ok(Format::Lz4),
             "deflate" | "raw" => Ok(Format::Deflate),
             "brotli" | "br" => Ok(Format::Brotli),
+            "lzo" | "lzo1x" => Ok(Format::Lzo),
+            "oodle" => Ok(Format::Oodle),
             other => Err(format!(
-                "unknown format '{other}' (expected one of gzip, zlib, zstd, xz, bzip2, lz4, deflate, brotli)"
+                "unknown format '{other}' (expected one of gzip, zlib, zstd, xz, bzip2, lz4, deflate, brotli, lzo, oodle)"
             )),
         }
     }
@@ -128,6 +150,32 @@ pub enum DecodeError {
     ChecksumMismatch,
     #[error("decompressed size exceeds the {0}-byte limit")]
     TooLarge(usize),
+    #[error("the {0} size must be known (from a length field, or given by hand)")]
+    SizeRequired(&'static str),
+    #[error("decodes to {compressed} -> {decompressed} bytes, which disagrees with the sizes given")]
+    SizeMismatch { compressed: usize, decompressed: usize },
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl From<Unavailable> for DecodeError {
+    fn from(e: Unavailable) -> Self {
+        DecodeError::Unavailable(e.to_string())
+    }
+}
+
+/// Sizes of a stream known from outside it: from the manifest, a length field or the
+/// user. Formats that can't find their own end (Oodle) need these to decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SizeHint {
+    pub compressed: Option<usize>,
+    pub decompressed: Option<usize>,
+}
+
+impl SizeHint {
+    pub fn exact(compressed: usize, decompressed: usize) -> Self {
+        Self { compressed: Some(compressed), decompressed: Some(decompressed) }
+    }
 }
 
 /// One compressed stream format. Each format lives in its own file under `codecs/`.
@@ -145,6 +193,29 @@ pub trait Codec: Send + Sync {
 
     /// Decode a stream that starts at `data[0]`. `data` may extend past the stream end.
     fn decode(&self, data: &[u8], ctx: &mut DecodeCtx) -> Result<Decoded, DecodeError>;
+
+    /// [`Codec::decode`] with sizes known from outside the stream. Formats that find
+    /// their own end ignore the hint; callers check the result against it.
+    fn decode_with_hint(&self, data: &[u8], hint: SizeHint, ctx: &mut DecodeCtx) -> Result<Decoded, DecodeError> {
+        let _ = hint;
+        self.decode(data, ctx)
+    }
+
+    /// Whether decoding needs [`SizeHint::decompressed`]: [`Codec::decode`] alone fails
+    /// with [`DecodeError::SizeRequired`]. The scanner then tries only sizes read from
+    /// integer fields just before each candidate.
+    fn needs_size(&self) -> bool {
+        false
+    }
+
+    /// Whether a scan only accepts this format where an integer field in the 16 bytes
+    /// before the stream holds its size: the decompressed size for formats that need it to
+    /// decode (Oodle), otherwise the compressed size, which the scan then decodes exactly
+    /// (raw LZO, whose start can't be told from its content, and which would be far too
+    /// slow to decode at every offset).
+    fn scan_needs_size_field(&self) -> bool {
+        self.needs_size()
+    }
 
     /// For unverified formats: how many bytes of `stream` count as evidence that it is
     /// real, compared against the raw minimum compressed size. Defaults to all of it.
@@ -170,14 +241,16 @@ pub trait Codec: Send + Sync {
 
     /// Encode `data` as a complete stream to replace `stream`, reusing whatever header
     /// fields the format allows (a gzip file name, for instance). Deterministic: the same
-    /// inputs always give the same bytes. Panics if `params` belong to another encoder;
-    /// use [`Codec::adapt_params`] first on untrusted params.
-    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Vec<u8>;
+    /// inputs always give the same bytes. Only encoders outside zscan (Oodle's library)
+    /// can fail. Panics if `params` belong to another encoder; use
+    /// [`Codec::adapt_params`] first on untrusted params.
+    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Result<Vec<u8>, String>;
 }
 
-/// The codec implementation for a format.
-pub fn codec_for(format: Format) -> &'static dyn Codec {
-    match format {
+/// The codec implementation for a format. Fails for a plugin format this build doesn't
+/// include, or for Oodle when its library can't be loaded; the error says how to fix it.
+pub fn codec_for(format: Format) -> Result<&'static dyn Codec, Unavailable> {
+    Ok(match format {
         Format::Gzip => &GzipCodec,
         Format::Zlib => &ZlibCodec,
         Format::Zstd => &ZstdCodec,
@@ -186,7 +259,9 @@ pub fn codec_for(format: Format) -> &'static dyn Codec {
         Format::Lz4 => &Lz4Codec,
         Format::Deflate => &DeflateCodec,
         Format::Brotli => &BrotliCodec,
-    }
+        Format::Lzo => crate::plugins::lzo()?,
+        Format::Oodle => crate::plugins::oodle()?,
+    })
 }
 
 const INITIAL_OUTPUT: usize = 64 * 1024;

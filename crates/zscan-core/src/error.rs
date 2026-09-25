@@ -30,6 +30,9 @@ pub enum Error {
     #[error("cancelled")]
     Cancelled,
 
+    #[error(transparent)]
+    Unavailable(#[from] crate::plugins::Unavailable),
+
     #[error("manifest names an unsafe output file {0:?} (must be a plain file name)")]
     BadFilename(String),
 }

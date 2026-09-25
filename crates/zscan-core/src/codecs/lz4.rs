@@ -157,7 +157,7 @@ impl Codec for Lz4Codec {
     fn find_params(&self, stream: &[u8], decoded: &Decoded) -> Option<EncoderParams> {
         let p = self.default_params(stream, decoded);
         block_size(params(&p).block_size)?;
-        (self.encode(stream, decoded, &decoded.data, &p) == stream).then_some(p)
+        self.encode(stream, decoded, &decoded.data, &p).is_ok_and(|s| s == stream).then_some(p)
     }
 
     fn default_params(&self, stream: &[u8], _decoded: &Decoded) -> EncoderParams {
@@ -198,7 +198,7 @@ impl Codec for Lz4Codec {
         }
     }
 
-    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], p: &EncoderParams) -> Vec<u8> {
+    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], p: &EncoderParams) -> Result<Vec<u8>, String> {
         let p = params(p);
         let info = FrameInfo::new()
             .block_size(block_size(p.block_size).expect("lz4 block size"))
@@ -208,6 +208,6 @@ impl Codec for Lz4Codec {
             .content_size(p.content_size.then_some(data.len() as u64));
         let mut encoder = FrameEncoder::with_frame_info(info, Vec::with_capacity(data.len() / 2 + 64));
         encoder.write_all(data).expect("writing to a Vec cannot fail");
-        encoder.finish().expect("lz4 frame finish")
+        Ok(encoder.finish().expect("lz4 frame finish"))
     }
 }

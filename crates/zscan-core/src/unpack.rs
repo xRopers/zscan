@@ -231,10 +231,10 @@ fn recreate(format: Format, method: &Method, data: &[u8], recon: Option<&[u8]>) 
     match method {
         Method::Encode { header, params } => {
             // Encoders only look at the original stream for its header.
-            let codec = codec_for(format);
+            let codec = codec_for(format).map_err(|e| e.to_string())?;
             let decoded = Decoded { compressed_size: header.len(), body: header.len()..header.len(), data: Vec::new(), original_name: None };
             let params = codec.adapt_params(header, &decoded, params)?;
-            Ok(codec.encode(header, &decoded, data, &params))
+            codec.encode(header, &decoded, data, &params)
         }
         Method::Preflate { header, trailer, .. } => {
             let corrections = recon.ok_or("missing preflate corrections")?;

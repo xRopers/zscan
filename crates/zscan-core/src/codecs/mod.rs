@@ -5,6 +5,10 @@ pub mod bzip2;
 pub mod deflate;
 pub mod gzip;
 pub mod lz4;
+#[cfg(feature = "lzo")]
+pub mod lzo;
+#[cfg(feature = "oodle")]
+pub mod oodle;
 mod util;
 pub mod xz;
 pub mod zlib;

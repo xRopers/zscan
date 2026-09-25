@@ -1,0 +1,51 @@
+{
+  "description": "raw LZO1X streams (LZO1X-1 and -999) behind u32 size fields, in random filler; scan with lzo enabled",
+  "size": 28227,
+  "streams": [
+    {
+      "compressed_size": 6772,
+      "crc32": "cd1f8bb3",
+      "decompressed_size": 20000,
+      "format": "lzo",
+      "offset": 708,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 3010,
+      "crc32": "66290112",
+      "decompressed_size": 9000,
+      "format": "lzo",
+      "offset": 7788,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 1135,
+      "crc32": "8811b810",
+      "decompressed_size": 3000,
+      "format": "lzo",
+      "offset": 11217,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 12411,
+      "crc32": "f412655e",
+      "decompressed_size": 40000,
+      "format": "lzo",
+      "offset": 12882,
+      "original_name": null,
+      "reproducible": true
+    },
+    {
+      "compressed_size": 1549,
+      "crc32": "109112a6",
+      "decompressed_size": 5000,
+      "format": "lzo",
+      "offset": 25934,
+      "original_name": null,
+      "reproducible": true
+    }
+  ]
+}

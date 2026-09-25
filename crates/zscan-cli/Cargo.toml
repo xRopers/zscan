@@ -9,6 +9,10 @@ rust-version.workspace = true
 name = "zscan"
 path = "src/main.rs"
 
+[features]
+lzo = ["zscan-core/lzo", "zscan-fixtures/lzo"]
+oodle = ["zscan-core/oodle"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

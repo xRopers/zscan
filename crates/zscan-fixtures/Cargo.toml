@@ -6,7 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+lzo = ["dep:lzo1x"]
+
 [dependencies]
+lzo1x = { workspace = true, optional = true }
 brotli.workspace = true
 bzip2.workspace = true
 lz4_flex.workspace = true

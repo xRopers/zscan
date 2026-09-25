@@ -164,12 +164,12 @@ impl Codec for ZstdCodec {
         [19, 22].into_iter().filter(|&l| l > base.level).map(|level| EncoderParams::Zstd(ZstdParams { level, ..base })).collect()
     }
 
-    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], p: &EncoderParams) -> Vec<u8> {
+    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], p: &EncoderParams) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         compress(data, params(p), |chunk| {
             out.extend_from_slice(chunk);
             true
         });
-        out
+        Ok(out)
     }
 }

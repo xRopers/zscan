@@ -5,8 +5,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Raw LZO1X. Encoding uses the lzo1x crate, a port of liblzo, which is GPL-2.0.
+lzo = ["dep:lzo1x", "zscan-fixtures/lzo"]
+# Oodle, through the user's own oo2core library loaded at run time. Never bundled.
+oodle = ["dep:libloading"]
+
 [dependencies]
 brotli.workspace = true
+libloading = { workspace = true, optional = true }
+lzo1x = { workspace = true, optional = true }
 bzip2.workspace = true
 lz4_flex.workspace = true
 xz2.workspace = true

@@ -190,8 +190,8 @@ impl Codec for DeflateCodec {
         stronger_family_params(base)
     }
 
-    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Vec<u8> {
-        compress_raw(data, family_params(params))
+    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Result<Vec<u8>, String> {
+        Ok(compress_raw(data, family_params(params)))
     }
 }
 

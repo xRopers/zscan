@@ -275,9 +275,9 @@ fn repacked_streams_of_every_format_are_reproducible() {
         let what = format!("{} stream {}", plan.format, plan.id);
         let params = found.exact_params.as_ref().unwrap_or_else(|| panic!("{what}: no exact params"));
         let stream = &out[found.offset as usize..found.end() as usize];
-        let codec = zscan_core::codec_for(found.format);
+        let codec = zscan_core::codec_for(found.format).unwrap();
         let decoded = codec.decode(stream, &mut ctx).unwrap();
-        assert!(codec.encode(stream, &decoded, &edits[&plan.id], params) == stream, "{what}");
+        assert!(codec.encode(stream, &decoded, &edits[&plan.id], params).unwrap() == stream, "{what}");
     }
 }
 
@@ -287,7 +287,7 @@ fn brotli_round_trip() {
     let f = zscan_fixtures::brotli_streams();
     let mut manifest = Manifest::new(SourceInfo::describe(Path::new("b.bin"), &f.data), ScanOptions::default(), vec![]);
     for e in &f.expected {
-        let found = zscan_core::decode_at(&f.data, e.offset as u64, zscan_core::Format::Brotli, 1 << 30, true).unwrap();
+        let found = zscan_core::decode_at(&f.data, e.offset as u64, zscan_core::Format::Brotli, Default::default(), 1 << 30, true).unwrap();
         manifest.add_stream(found).unwrap();
     }
     let edits = BTreeMap::from([(0, shrink(&f.expected[0].payload))]);

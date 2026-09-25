@@ -16,10 +16,11 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::checksum::crc32;
-use crate::codec::{Codec, DecodeCtx, DecodeError, Format, codec_for};
+use crate::codec::{Codec, DecodeCtx, DecodeError, Decoded, Format, SizeHint, codec_for};
 use crate::entropy::shannon;
 use crate::error::{Error, Result};
 use crate::params::EncoderParams;
+use crate::plugins::Unavailable;
 
 pub const DEFAULT_MIN_SIZE: u64 = 32;
 pub const DEFAULT_RAW_MIN_COMPRESSED: u64 = 256;
@@ -76,6 +77,14 @@ fn default_raw_min_ratio() -> f64 {
     DEFAULT_RAW_MIN_RATIO
 }
 
+impl ScanOptions {
+    /// Error if a format to scan for is missing from this build, or is Oodle and its
+    /// library can't be loaded. [`scan`] skips such formats; front ends should check first.
+    pub fn check_formats(&self) -> Result<(), Unavailable> {
+        self.formats.iter().try_for_each(|f| f.available())
+    }
+}
+
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
@@ -113,6 +122,7 @@ impl FoundStream {
 }
 
 /// Find every stream in `data` that passes the filters in `opts`, sorted by offset.
+/// Formats that aren't available are skipped (see [`ScanOptions::check_formats`]).
 pub fn scan(data: &[u8], opts: &ScanOptions) -> Vec<FoundStream> {
     scan_with_stats(data, opts).0
 }
@@ -138,8 +148,10 @@ pub fn scan_with_stats(data: &[u8], opts: &ScanOptions) -> (Vec<FoundStream>, Sc
 }
 
 /// [`scan_with_stats`], reporting progress to (and cancellable from) another thread.
-/// Returns [`Error::Cancelled`] if [`Progress::cancel`] was called.
+/// Returns [`Error::Cancelled`] if [`Progress::cancel`] was called, and fails up front if
+/// a format isn't available.
 pub fn scan_with_progress(data: &[u8], opts: &ScanOptions, progress: &Progress) -> Result<(Vec<FoundStream>, ScanStats)> {
+    opts.check_formats()?;
     let result = scan_chunked(data, opts, chunk_size(data.len()), progress);
     if progress.is_cancelled() { Err(Error::Cancelled) } else { Ok(result) }
 }
@@ -216,7 +228,7 @@ fn scan_chunked(data: &[u8], opts: &ScanOptions, chunk: usize, progress: &Progre
     formats.sort();
     formats.dedup();
     let (verified, unverified): (Vec<&dyn Codec>, Vec<&dyn Codec>) =
-        formats.into_iter().map(codec_for).partition(|c| c.self_verifying());
+        formats.into_iter().filter_map(|f| codec_for(f).ok()).partition(|c| c.self_verifying());
 
     let t = Instant::now();
     let mut found = Vec::new();
@@ -353,18 +365,26 @@ fn resolve_unverified(hits: Vec<FoundStream>) -> Vec<FoundStream> {
 
 /// Decode a stream of `format` starting exactly at `offset`, with no scan filters
 /// applied. This is how formats that can't be scanned for (brotli) are found, and how a
-/// front end can test a location by hand. With `match_params`, exact encoder settings
-/// are searched for as in a scan.
+/// front end can test a location by hand. `hint` carries sizes known from elsewhere
+/// (Oodle needs the decompressed size), which the stream must agree with. With
+/// `match_params`, exact encoder settings are searched for as in a scan.
 pub fn decode_at(
     data: &[u8],
     offset: u64,
     format: Format,
+    hint: SizeHint,
     max_output: u64,
     match_params: bool,
 ) -> Result<FoundStream, DecodeError> {
     let start = usize::try_from(offset).ok().filter(|&o| o < data.len()).ok_or(DecodeError::Truncated)?;
+    let codec = codec_for(format)?;
     let mut ctx = DecodeCtx::new(usize::try_from(max_output).unwrap_or(usize::MAX));
-    let decoded = codec_for(format).decode(&data[start..], &mut ctx)?;
+    let decoded = codec.decode_with_hint(&data[start..], hint, &mut ctx)?;
+    if hint.compressed.is_some_and(|n| n != decoded.compressed_size)
+        || hint.decompressed.is_some_and(|n| n != decoded.data.len())
+    {
+        return Err(DecodeError::SizeMismatch { compressed: decoded.compressed_size, decompressed: decoded.data.len() });
+    }
     let mut found = FoundStream {
         offset,
         format,
@@ -376,7 +396,7 @@ pub fn decode_at(
     };
     if match_params {
         let stream = &data[start..start + decoded.compressed_size];
-        found.exact_params = codec_for(format).find_params(stream, &decoded);
+        found.exact_params = codec.find_params(stream, &decoded);
     }
     Ok(found)
 }
@@ -385,8 +405,55 @@ pub fn decode_at(
 fn match_params(data: &[u8], found: &mut FoundStream, ctx: &mut DecodeCtx) {
     let start = found.offset as usize;
     let stream = &data[start..start + found.compressed_size as usize];
-    let Ok(decoded) = codec_for(found.format).decode(stream, ctx) else { return };
-    found.exact_params = codec_for(found.format).find_params(stream, &decoded);
+    let Ok(codec) = codec_for(found.format) else { return };
+    let hint = SizeHint::exact(stream.len(), found.decompressed_size as usize);
+    let Ok(decoded) = codec.decode_with_hint(stream, hint, ctx) else { return };
+    found.exact_params = codec.find_params(stream, &decoded);
+}
+
+/// Sizes a stream at `pos` might have, read from integer fields in the 16 bytes before
+/// it: 32-bit little and big endian at 4-byte steps back, and 64-bit little endian at
+/// 8-byte steps (see [`Codec::scan_needs_size_field`]).
+fn sizes_before(data: &[u8], pos: usize, max_output: usize) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    let mut add = |v: u64| {
+        if let Ok(v) = usize::try_from(v)
+            && (1..=max_output).contains(&v)
+            && !sizes.contains(&v)
+        {
+            sizes.push(v);
+        }
+    };
+    for back in [4, 8, 12, 16] {
+        let Some(start) = pos.checked_sub(back) else { break };
+        let b: [u8; 4] = data[start..start + 4].try_into().expect("4 bytes");
+        add(u64::from(u32::from_le_bytes(b)));
+        add(u64::from(u32::from_be_bytes(b)));
+        if back % 8 == 0 {
+            add(u64::from_le_bytes(data[start..start + 8].try_into().expect("8 bytes")));
+        }
+    }
+    sizes
+}
+
+/// Decode at `data[pos..end]`. A codec that needs the decompressed size is tried with
+/// each size found just before `pos`, nearest field first: Oodle decodes some streams
+/// with a size that is a little off, and the field next to the data is the likeliest.
+fn decode_candidate(codec: &dyn Codec, data: &[u8], pos: usize, end: usize, ctx: &mut DecodeCtx) -> Option<Decoded> {
+    let window = &data[pos..end];
+    if codec.needs_size() {
+        return sizes_before(data, pos, ctx.max_output()).into_iter().find_map(|size| {
+            let hint = SizeHint { compressed: None, decompressed: Some(size) };
+            codec.decode_with_hint(window, hint, ctx).ok()
+        });
+    }
+    if codec.scan_needs_size_field() {
+        return sizes_before(data, pos, window.len()).into_iter().find_map(|size| {
+            let hint = SizeHint { compressed: Some(size), decompressed: None };
+            codec.decode_with_hint(&window[..size], hint, ctx).ok().filter(|d| d.compressed_size == size)
+        });
+    }
+    codec.decode(window, ctx).ok()
 }
 
 /// The first codec whose stream at `pos` decodes and passes the filters.
@@ -403,7 +470,13 @@ fn try_at(
         if !codec.probe(window) {
             continue;
         }
-        let Ok(decoded) = codec.decode(window, ctx) else { continue };
+        let Some(decoded) = decode_candidate(*codec, data, pos, end, ctx) else { continue };
+        if codec.scan_needs_size_field() {
+            let sizes = sizes_before(data, pos, usize::MAX);
+            if !sizes.contains(&decoded.compressed_size) && !sizes.contains(&decoded.data.len()) {
+                continue;
+            }
+        }
         let format = codec.format();
         let stream = &window[..decoded.compressed_size];
         let result = accept(*codec, stream, &decoded.data, opts).then(|| FoundStream {
@@ -453,7 +526,7 @@ mod tests {
         formats.sort();
         formats.dedup();
         let (verified, unverified): (Vec<&dyn Codec>, Vec<&dyn Codec>) =
-            formats.into_iter().map(codec_for).partition(|c| c.self_verifying());
+            formats.into_iter().map(|f| codec_for(f).unwrap()).partition(|c| c.self_verifying());
         let mut found = Vec::new();
         scan_range(data, 0, data.len(), &verified, opts, &mut ctx, &mut found);
         if !unverified.is_empty() {
@@ -496,7 +569,7 @@ mod tests {
             // An unverified match can be a false positive that starts a little before a real
             // stream, decodes its first bytes as garbage and stops inside it. If a match that
             // starts inside this one runs past its end, the later match is the real stream.
-            if !codec_for(best.format).self_verifying() {
+            if !codec_for(best.format).unwrap().self_verifying() {
                 let mut p = best.offset as usize + 1;
                 while p < best.end() as usize {
                     if let Some(other) = try_at(data, p, end, codecs, opts, ctx) {

@@ -214,12 +214,12 @@ impl Codec for XzCodec {
         if *base == strongest { vec![] } else { vec![strongest] }
     }
 
-    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], p: &EncoderParams) -> Vec<u8> {
+    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], p: &EncoderParams) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         compress(data, params(p), |chunk| {
             out.extend_from_slice(chunk);
             true
         });
-        out
+        Ok(out)
     }
 }

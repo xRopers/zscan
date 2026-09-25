@@ -21,6 +21,8 @@ pub enum EncoderParams {
     Bzip2(Bzip2Params),
     Lz4(Lz4Params),
     Brotli(BrotliParams),
+    Lzo(LzoParams),
+    Oodle(OodleParams),
 }
 
 impl EncoderParams {
@@ -64,6 +66,14 @@ impl fmt::Display for EncoderParams {
                 if p.content_size { " +size" } else { "" },
             ),
             EncoderParams::Brotli(p) => write!(f, "Q{} W{} {:?}", p.quality, p.lgwin, p.mode),
+            EncoderParams::Lzo(p) => match p.level {
+                1 => f.write_str("lzo1x_1_11"),
+                2 => f.write_str("lzo1x_1_12"),
+                3 => f.write_str("lzo1x_1"),
+                4 => f.write_str("lzo1x_1_15"),
+                l => write!(f, "lzo1x_999 L{}", l.saturating_sub(4)),
+            },
+            EncoderParams::Oodle(p) => write!(f, "{:?} L{}", p.compressor, p.level),
         }
     }
 }
@@ -133,4 +143,32 @@ pub enum BrotliMode {
     Generic,
     Text,
     Font,
+}
+
+/// liblzo's LZO1X compressors, as ported by the `lzo1x` crate, whose level numbers these
+/// are: 1-4 are LZO1X-1 with 11, 12, 14 and 15 dictionary bits (`lzo1x_1_11`,
+/// `lzo1x_1_12`, `lzo1x_1` as in minilzo, `lzo1x_1_15`); 5-13 are LZO1X-999 levels 1-9
+/// (`lzo1x_999_compress` is level 8, so 12 here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LzoParams {
+    pub level: u8,
+}
+
+/// Settings for `OodleLZ_Compress` in the user's oo2core library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OodleParams {
+    pub compressor: OodleCompressor,
+    /// `OodleLZ_CompressionLevel`: -4 to -1 HyperFast4-1, 0 none, 1 SuperFast, 2 VeryFast,
+    /// 3 Fast, 4 Normal, 5-9 Optimal1-5.
+    pub level: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OodleCompressor {
+    Kraken,
+    Mermaid,
+    Selkie,
+    Leviathan,
+    Hydra,
 }

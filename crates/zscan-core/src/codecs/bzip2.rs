@@ -68,7 +68,7 @@ impl Codec for Bzip2Codec {
     /// libbzip2's output depends only on the block size, which the header states.
     fn find_params(&self, stream: &[u8], decoded: &Decoded) -> Option<EncoderParams> {
         let p = self.default_params(stream, decoded);
-        (self.encode(stream, decoded, &decoded.data, &p) == stream).then_some(p)
+        self.encode(stream, decoded, &decoded.data, &p).is_ok_and(|s| s == stream).then_some(p)
     }
 
     fn default_params(&self, stream: &[u8], _decoded: &Decoded) -> EncoderParams {
@@ -88,7 +88,7 @@ impl Codec for Bzip2Codec {
         if *base == strongest { vec![] } else { vec![strongest] }
     }
 
-    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], p: &EncoderParams) -> Vec<u8> {
+    fn encode(&self, _stream: &[u8], _decoded: &Decoded, data: &[u8], p: &EncoderParams) -> Result<Vec<u8>, String> {
         let mut c = Compress::new(Compression::new(params(p).level), 30);
         let mut out = Vec::with_capacity(data.len() / 2 + 64);
         loop {
@@ -97,7 +97,7 @@ impl Codec for Bzip2Codec {
             }
             let status = c.compress_vec(&data[c.total_in() as usize..], &mut out, Action::Finish).expect("bzip2 compress");
             if status == Status::StreamEnd {
-                return out;
+                return Ok(out);
             }
         }
     }

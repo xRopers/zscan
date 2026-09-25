@@ -67,13 +67,13 @@ impl Codec for ZlibCodec {
     }
 
     /// Reuses the original 2-byte header and appends a fresh Adler-32.
-    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Vec<u8> {
+    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Result<Vec<u8>, String> {
         let body = compress_raw(data, family_params(params));
         let mut out = Vec::with_capacity(HEADER_LEN + body.len() + TRAILER_LEN);
         out.extend_from_slice(&stream[..decoded.body.start]);
         out.extend_from_slice(&body);
         out.extend_from_slice(&adler32(data).to_be_bytes());
-        out
+        Ok(out)
     }
 }
 
@@ -109,7 +109,7 @@ mod tests {
         // Made by zlib at its defaults, so the search finds them and encode rebuilds it.
         let found = ZlibCodec.find_params(&stream, &d).unwrap();
         assert_eq!(found, EncoderParams::Deflate(DeflateParams::zlib_default(15)));
-        assert_eq!(ZlibCodec.encode(&stream, &d, b"hello", &found), stream);
+        assert_eq!(ZlibCodec.encode(&stream, &d, b"hello", &found).unwrap(), stream);
 
         let mut bad = stream;
         bad[12] ^= 1;

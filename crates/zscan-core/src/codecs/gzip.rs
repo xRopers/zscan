@@ -124,7 +124,7 @@ impl Codec for GzipCodec {
 
     /// Reuses the original header (name, mtime, flags, header CRC) and appends a fresh
     /// CRC-32 and size.
-    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Vec<u8> {
+    fn encode(&self, stream: &[u8], decoded: &Decoded, data: &[u8], params: &EncoderParams) -> Result<Vec<u8>, String> {
         let header = &stream[..decoded.body.start];
         let body = compress_raw(data, family_params(params));
         let mut out = Vec::with_capacity(header.len() + body.len() + TRAILER_LEN);
@@ -132,7 +132,7 @@ impl Codec for GzipCodec {
         out.extend_from_slice(&body);
         out.extend_from_slice(&crc32(data).to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out
+        Ok(out)
     }
 }
 

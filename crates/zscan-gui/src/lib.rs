@@ -9,6 +9,7 @@ pub mod jobs;
 pub mod preview;
 pub mod project;
 pub mod session;
+pub mod settings;
 pub mod widgets;
 
 pub use app::App;

@@ -7,8 +7,8 @@ use serde::Serialize;
 use zscan_core::entropy::{entropy_map, shannon};
 use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_MIN_SIZE, DEFAULT_RAW_MAX_ENTROPY, DEFAULT_RAW_MIN_COMPRESSED, DEFAULT_RAW_MIN_RATIO};
 use zscan_core::{
-    DetectOptions, ExtractOptions, FieldCandidate, FieldUpdate, Format, Manifest, Outcome, PackOptions, PackResult,
-    RebuildSummary, ScanOptions, apply_unambiguous, check_fields, detect_fields, rebuild, unpack, ScanStats, SourceInfo, StreamEntry,
+    DetectOptions, ExtractOptions, FieldCandidate, FieldUpdate, Format, Manifest, Outcome, PackOptions,
+    ScanOptions, apply_unambiguous, check_fields, detect_fields, rebuild_file, unpack, ScanStats, SourceInfo, StreamEntry,
     StreamPlan, decode_at, extract_all, input, load_edits, pack, scan, scan_with_stats,
 };
 
@@ -428,10 +428,9 @@ fn cmd_pack(
 
     let mut written = None;
     if !dry_run && result.fits() {
-        let mut packed_manifest = write_verified(output, &data, &result)?;
+        let packed_manifest = result.write_file(&data, output)?;
         written = Some(output.display().to_string());
         if let Some(path) = manifest_out {
-            packed_manifest.source.path = output.display().to_string();
             packed_manifest.save(path)?;
         }
     }
@@ -536,36 +535,6 @@ fn default_packed_path(input: &Path) -> PathBuf {
     input.with_file_name(name)
 }
 
-/// Stream the packed file to a temporary file next to `path`, read it back and verify
-/// every stream, then rename it into place. A failed write or verify never leaves a
-/// half-written or wrong output behind. Returns the manifest for the output.
-fn write_verified(path: &Path, input_data: &[u8], result: &PackResult) -> Result<Manifest> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".zscan-tmp");
-    let tmp = PathBuf::from(tmp);
-    let outcome = (|| -> Result<Manifest> {
-        let file = std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
-        result
-            .write_to(input_data, std::io::BufWriter::with_capacity(8 << 20, file))
-            .map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
-        // The mapping must be dropped before the rename (Windows won't rename a mapped file).
-        let written = input::open(&tmp)?;
-        Ok(result.verify_output(&written)?)
-    })();
-    let manifest = match outcome {
-        Ok(manifest) => manifest,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-    };
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        bail!("{}: {e}", path.display());
-    }
-    Ok(manifest)
-}
-
 fn cmd_unpack(file: &Path, dir: &Path, manifest: Option<&Path>, filters: &ScanArgs, json: bool) -> Result<()> {
     let data = input::open(file)?;
     let manifest = match manifest {
@@ -593,24 +562,7 @@ fn cmd_unpack(file: &Path, dir: &Path, manifest: Option<&Path>, filters: &ScanAr
 }
 
 fn cmd_rebuild(dir: &Path, output: &Path, json: bool) -> Result<()> {
-    let mut tmp = output.as_os_str().to_owned();
-    tmp.push(".zscan-tmp");
-    let tmp = PathBuf::from(tmp);
-    let outcome = (|| -> Result<RebuildSummary> {
-        let file = std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
-        Ok(rebuild(dir, std::io::BufWriter::with_capacity(8 << 20, file))?)
-    })();
-    let summary = match outcome {
-        Ok(summary) => summary,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-    };
-    if let Err(e) = std::fs::rename(&tmp, output) {
-        let _ = std::fs::remove_file(&tmp);
-        bail!("{}: {e}", output.display());
-    }
+    let summary = rebuild_file(dir, output)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {

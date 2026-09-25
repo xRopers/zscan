@@ -85,7 +85,7 @@ All commands support `--json` output for scripting.
   - The tests read packed archives with an independent reader (`zscan_fixtures::read_archive`).
 - Stage 5B (`unpack.rs`): `zscan unpack FILE -d DIR` / `zscan rebuild DIR -o FILE`, a precomp-style bit-exact round trip.
   - The directory holds `unpack.json`, `gaps.bin`, `streams/` (contents) and `recon/`.
-  - Each stream uses the first method that reproduces it, checked at unpack time: encode (exact params + original header), then preflate (`preflate-rs` 0.7.6, which needs Rust 1.89: this is why the MSRV is 1.89), then stored verbatim.
+  - Each stream uses the first method that reproduces it, checked at unpack time: encode (exact params + original header), then preflate (`preflate-rs` 0.7.6, which needs Rust 1.89: this is why the MSRV is 1.89; the GUI needs 1.95 for egui 0.36), then stored verbatim.
   - Rebuild checks whole-file size and CRC, and refuses edited contents (edits go through pack).
   - Results: 512 MiB dense archive → unpacked form compresses 33% smaller with zstd -19. 4 GiB unpack 4 s, rebuild 6.5 s. preflate fails on some miniz streams (prediction failure at any chain length); those fall back to stored.
 - Overlap rule for unverified formats (`later_match_wins`): a later match replaces the current one only if it runs further *and* no match starting at or after the current end ends where it does. That second condition keeps back-to-back raw streams, where a misaligned decode from the first one's tail resyncs into the second.

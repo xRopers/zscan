@@ -15,7 +15,7 @@ Windows x64 builds are on the [Releases](https://github.com/xRopers/zscan/releas
 
 ## Build from source
 
-Rust 1.89 or later:
+Rust 1.95 or later (1.89 for the command line alone):
 
 ```bash
 cargo build --release

@@ -6,7 +6,10 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use zscan_core::entropy::{entropy_map, shannon};
 use zscan_core::scan::{DEFAULT_MAX_OUTPUT, DEFAULT_MIN_SIZE, DEFAULT_RAW_MAX_ENTROPY, DEFAULT_RAW_MIN_COMPRESSED};
-use zscan_core::{ExtractOptions, Format, Manifest, ScanOptions, SourceInfo, StreamEntry, extract_all, input, scan};
+use zscan_core::{
+    ExtractOptions, Format, Manifest, Outcome, PackOptions, ScanOptions, SourceInfo, StreamEntry, StreamPlan,
+    extract_all, input, load_edits, pack, scan,
+};
 
 #[derive(Parser)]
 #[command(name = "zscan", version, about = "Find, extract and reinject compressed streams inside binary files")]
@@ -46,6 +49,32 @@ enum Command {
         #[command(flatten)]
         filters: ScanArgs,
     },
+    /// Reinject edited files from an extract directory into a copy of the input
+    Pack {
+        file: PathBuf,
+        /// Manifest from `zscan scan -o`
+        #[arg(short, long)]
+        manifest: PathBuf,
+        /// Directory with the extracted (and edited) files
+        #[arg(short = 'd', long = "dir", value_name = "DIR")]
+        dir: PathBuf,
+        /// Output file [default: <input stem>.packed.<ext> next to the input]
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Show per-stream results without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Also write a manifest describing the packed file
+        #[arg(long, value_name = "MANIFEST")]
+        manifest_out: Option<PathBuf>,
+        /// Let a stream grow into zero bytes that follow it. Only safe if whatever reads
+        /// the file finds the stream's end by decoding it, not from a stored size
+        #[arg(long)]
+        use_slack: bool,
+        /// Pack even if the input's size or CRC no longer matches the manifest
+        #[arg(long)]
+        force: bool,
+    },
     /// Summary of a file: entropy map and the streams it contains
     Info {
         file: PathBuf,
@@ -80,6 +109,9 @@ struct ScanArgs {
     /// Largest decompressed size accepted for a single stream
     #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT)]
     max_output: u64,
+    /// Skip searching for the zlib settings that reproduce each stream exactly
+    #[arg(long)]
+    no_match: bool,
 }
 
 impl ScanArgs {
@@ -92,6 +124,7 @@ impl ScanArgs {
             min_ratio: self.min_ratio,
             max_entropy: self.max_entropy,
             max_output: self.max_output,
+            match_params: !self.no_match,
         }
     }
 }
@@ -111,6 +144,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Scan { file, output, filters } => cmd_scan(&file, output.as_deref(), &filters, cli.json),
         Command::Extract { file, manifest, dir, force, filters } => {
             cmd_extract(&file, manifest.as_deref(), &dir, force, &filters, cli.json)
+        }
+        Command::Pack { file, manifest, dir, output, dry_run, manifest_out, use_slack, force } => {
+            let output = output.unwrap_or_else(|| default_packed_path(&file));
+            let opts = PackOptions { verify_source: !force, use_zero_slack: use_slack };
+            cmd_pack(&file, &manifest, &dir, &output, manifest_out.as_deref(), dry_run, &opts, cli.json)
         }
         Command::Info { file, blocks, filters } => cmd_info(&file, blocks, &filters, cli.json),
     }
@@ -153,7 +191,8 @@ fn cmd_extract(
     let data = input::open(file)?;
     let manifest = match manifest {
         Some(path) => Manifest::load(path)?,
-        None => build_manifest(file, &data, filters.options()),
+        // Params only matter for packing, which needs a saved manifest anyway.
+        None => build_manifest(file, &data, ScanOptions { match_params: false, ..filters.options() }),
     };
     let files = extract_all(&data, &manifest, dir, &ExtractOptions { verify_source: !force })?;
     if json {
@@ -185,7 +224,7 @@ fn cmd_info(file: &Path, blocks: usize, filters: &ScanArgs, json: bool) -> Resul
     // Entropy of an n-byte block can't exceed log2(n), so tiny blocks all look alike.
     const MIN_BLOCK: usize = 256;
     let map = entropy_map(&data, blocks.min(data.len().div_ceil(MIN_BLOCK)));
-    let found = scan(&data, &filters.options());
+    let found = scan(&data, &ScanOptions { match_params: false, ..filters.options() });
     let report = InfoReport {
         file: file.display().to_string(),
         size: data.len() as u64,
@@ -243,21 +282,156 @@ fn print_streams(streams: &[StreamEntry]) {
         return;
     }
     println!(
-        "{:>5}  {:>10}  {:<7}  {:>12}  {:>12}  {:>7}  file",
-        "id", "offset", "format", "compressed", "decompressed", "ratio"
+        "{:>5}  {:>10}  {:<7}  {:>12}  {:>12}  {:>7}  {:<22}  file",
+        "id", "offset", "format", "compressed", "decompressed", "ratio", "exact params"
     );
     for s in streams {
+        let params = s.params.deflate_params().filter(|_| s.params.exact_match).map_or("-".into(), |p| p.to_string());
         println!(
-            "{:>5}  {:#010x}  {:<7}  {:>12}  {:>12}  {:>7.2}  {}",
+            "{:>5}  {:#010x}  {:<7}  {:>12}  {:>12}  {:>7.2}  {:<22}  {}",
             s.id,
             s.offset,
             s.format.name(),
             s.compressed_size,
             s.decompressed_size,
             s.ratio(),
+            params,
             s.file
         );
     }
+}
+
+#[derive(Serialize)]
+struct PackReport<'a> {
+    dry_run: bool,
+    written: Option<String>,
+    streams: &'a [StreamPlan],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_pack(
+    file: &Path,
+    manifest_path: &Path,
+    dir: &Path,
+    output: &Path,
+    manifest_out: Option<&Path>,
+    dry_run: bool,
+    opts: &PackOptions,
+    json: bool,
+) -> Result<()> {
+    if same_file(output, file) {
+        bail!("refusing to overwrite the input file; choose a different --output");
+    }
+    let data = input::open(file)?;
+    let manifest = Manifest::load(manifest_path)?;
+    let edits = load_edits(dir, &manifest)?;
+    let result = pack(&data, &manifest, &edits, opts)?;
+
+    let mut written = None;
+    if !dry_run {
+        if let (Some(packed), Some(packed_manifest)) = (&result.data, &result.manifest) {
+            write_via_temp(output, packed)?;
+            written = Some(output.display().to_string());
+            if let Some(path) = manifest_out {
+                let mut packed_manifest = packed_manifest.clone();
+                packed_manifest.source.path = output.display().to_string();
+                packed_manifest.save(path)?;
+            }
+        }
+    }
+
+    if json {
+        let report = PackReport { dry_run, written: written.clone(), streams: &result.streams };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_pack_plan(&result.streams);
+        let repacked = result.repacked().count();
+        let unchanged = result.streams.len() - repacked - result.failures().count();
+        println!("{repacked} stream(s) repacked, {unchanged} unchanged");
+        if edits.is_empty() {
+            println!("no edited files found in {}", dir.display());
+        }
+        match (&written, dry_run) {
+            (Some(path), _) => println!("written to {path} (every stream verified)"),
+            (None, true) if result.data.is_some() => println!("dry run: everything fits and verifies; nothing written"),
+            _ => {}
+        }
+    }
+
+    let failures: Vec<String> = result
+        .failures()
+        .map(|s| {
+            let Outcome::TooLarge { best_size, available } = s.outcome else { unreachable!() };
+            format!(
+                "stream {} at {:#x}: {} bytes over (smallest encoding is {best_size} bytes, slot is {available})",
+                s.id,
+                s.offset,
+                best_size - available
+            )
+        })
+        .collect();
+    if !failures.is_empty() {
+        bail!("{} stream(s) don't fit, nothing written:\n  {}", failures.len(), failures.join("\n  "));
+    }
+    Ok(())
+}
+
+fn print_pack_plan(streams: &[StreamPlan]) {
+    println!(
+        "{:>5}  {:>10}  {:<7}  {:<10}  {:>10}  {:>10}  {:>8}  params",
+        "id", "offset", "format", "status", "old size", "new size", "delta"
+    );
+    for s in streams {
+        let (status, detail) = match &s.outcome {
+            Outcome::Unchanged => ("unchanged", String::new()),
+            Outcome::Repacked { params, reused_original_params, slack_used, .. } => {
+                let mut detail = params.to_string();
+                if *reused_original_params {
+                    detail += " (original)";
+                }
+                if *slack_used > 0 {
+                    detail += &format!(", {slack_used} bytes of slack");
+                }
+                ("repacked", detail)
+            }
+            Outcome::TooLarge { best_size, available } => ("TOO LARGE", format!("{} bytes over", best_size - available)),
+        };
+        let delta = if s.outcome == Outcome::Unchanged { String::new() } else { format!("{:+}", s.delta()) };
+        println!(
+            "{:>5}  {:#010x}  {:<7}  {:<10}  {:>10}  {:>10}  {:>8}  {detail}",
+            s.id,
+            s.offset,
+            s.format.name(),
+            status,
+            s.original_size,
+            s.new_size(),
+            delta
+        );
+    }
+}
+
+/// `dir/name.ext` -> `dir/name.packed.ext`
+fn default_packed_path(input: &Path) -> PathBuf {
+    let stem = input.file_stem().map_or("output".into(), |s| s.to_string_lossy());
+    let name = match input.extension() {
+        Some(ext) => format!("{stem}.packed.{}", ext.to_string_lossy()),
+        None => format!("{stem}.packed"),
+    };
+    input.with_file_name(name)
+}
+
+/// Write to a temporary file next to `path`, then rename, so a failed write never
+/// leaves a half-written output behind.
+fn write_via_temp(path: &Path, data: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".zscan-tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, data).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("{}: {e}", path.display());
+    }
+    Ok(())
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

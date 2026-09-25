@@ -21,6 +21,7 @@ fn main() -> std::io::Result<()> {
                     "decompressed_size": e.payload.len(),
                     "crc32": format!("{:08x}", crc32fast::hash(&e.payload)),
                     "original_name": e.name,
+                    "zlib_made": e.zlib_made,
                 })
             })
             .collect();

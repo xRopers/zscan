@@ -56,8 +56,10 @@ All commands support `--json` output for scripting.
 6. GUI (egui for speed of building, or Tauri for a richer hex/preview UI): entropy map, stream table (offset, format, sizes, ratio, detected type, exact-match flag), preview pane (hex/text/image), mark edited streams, pack view with dry-run + verify, save/load manifest as a project.
 
 ## Status
-- Stage 1 done: `zscan scan | extract | info`. `pack` arrives with stage 2.
-- Inflate uses `miniz_oxide`'s core API directly: O(1) reset per candidate offset, one reused buffer (`DecodeCtx`). `flate2`/`libz-sys` come in at stage 2 for exact-param recompression.
+- Stages 1–2 done: `zscan scan | extract | pack | info`.
+- Inflate uses `miniz_oxide`'s core API directly: O(1) reset per candidate offset, one reused buffer (`DecodeCtx`). Compression uses stock zlib 1.3.2, bundled static via `libz-sys` (`deflater.rs`), because that's what most files were made with. Don't enable zlib-ng: its output differs.
+- Param matching compares only the deflate *body*. Pack reuses each stream's original header bytes (gzip name/mtime/flags, zlib FLEVEL) and recomputes the trailer. Level 0 is matched as a single `compress2`-style call, because stored block sizes depend on output buffering.
+- Pack copies unedited streams byte for byte. Edited streams try the matched params first, then level 9 × memLevel {9,8} × {default, filtered}, never with a window larger than the original header declares. Output is verified by decoding every stream before anything is written. Zero slack is opt-in (`--use-slack`); relocation and length fields are stage 5.
 - Scan runs two passes: gzip/zlib first, then raw deflate only in the gaps. A raw match that a later match starting inside it runs past is dropped as misaligned.
 - Raw deflate defaults (from 256 MiB of random data, 0 FPs): min 256 *compressed* bytes, output entropy ≤ 7.5. Speed is about 3 MB/s single-threaded because fixed-Huffman garbage decoding dominates. That's the stage 3 target.
 - Fixtures: `crates/zscan-fixtures` builds them deterministically; `cargo run -p zscan-fixtures --bin gen-fixtures` writes `tests/fixtures/*.bin` + `*.expected.json`.

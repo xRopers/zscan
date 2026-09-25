@@ -97,10 +97,20 @@ impl Codec for GzipCodec {
         }
         Ok(Decoded {
             compressed_size: end + TRAILER_LEN,
+            body: header.len..end,
             data: ctx.take_output(len),
             params: CompressionParams::default(),
             original_name: header.name,
         })
+    }
+
+    fn wrap(&self, header: &[u8], body: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(header.len() + body.len() + TRAILER_LEN);
+        out.extend_from_slice(header);
+        out.extend_from_slice(body);
+        out.extend_from_slice(&crc32(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
     }
 }
 

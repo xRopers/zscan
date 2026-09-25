@@ -63,10 +63,16 @@ impl Codec for DeflateCodec {
         let (consumed, len) = ctx.inflate(data)?;
         Ok(Decoded {
             compressed_size: consumed,
+            body: 0..consumed,
             data: ctx.take_output(len),
             params: CompressionParams::default(),
             original_name: None,
         })
+    }
+
+    fn wrap(&self, header: &[u8], body: &[u8], _data: &[u8]) -> Vec<u8> {
+        debug_assert!(header.is_empty());
+        body.to_vec()
     }
 }
 

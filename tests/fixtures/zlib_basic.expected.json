@@ -1,46 +1,60 @@
 {
-  "description": "zlib streams at several levels, a stored stream, a 4 KiB-window header, back-to-back streams",
-  "size": 9428,
+  "description": "zlib streams at several levels, a stored stream, a 4 KiB-window header, back-to-back streams, one made by miniz",
+  "size": 10636,
   "streams": [
     {
-      "compressed_size": 1221,
+      "compressed_size": 1219,
       "crc32": "a32eef86",
       "decompressed_size": 5000,
       "format": "zlib",
       "offset": 1000,
-      "original_name": null
+      "original_name": null,
+      "zlib_made": true
     },
     {
       "compressed_size": 4042,
       "crc32": "f44ce478",
       "decompressed_size": 20000,
       "format": "zlib",
-      "offset": 2998,
-      "original_name": null
+      "offset": 2996,
+      "original_name": null,
+      "zlib_made": true
     },
     {
-      "compressed_size": 1116,
+      "compressed_size": 1031,
       "crc32": "71d2c763",
       "decompressed_size": 3000,
       "format": "zlib",
-      "offset": 7140,
-      "original_name": null
+      "offset": 7138,
+      "original_name": null,
+      "zlib_made": true
     },
     {
       "compressed_size": 111,
       "crc32": "6d1ac872",
       "decompressed_size": 100,
       "format": "zlib",
-      "offset": 8256,
-      "original_name": null
+      "offset": 8169,
+      "original_name": null,
+      "zlib_made": true
     },
     {
       "compressed_size": 561,
       "crc32": "5272122e",
       "decompressed_size": 2000,
       "format": "zlib",
-      "offset": 8367,
-      "original_name": null
+      "offset": 8280,
+      "original_name": null,
+      "zlib_made": true
+    },
+    {
+      "compressed_size": 995,
+      "crc32": "15d25d74",
+      "decompressed_size": 4000,
+      "format": "zlib",
+      "offset": 9341,
+      "original_name": null,
+      "zlib_made": false
     }
   ]
 }

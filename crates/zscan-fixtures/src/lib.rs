@@ -2,6 +2,9 @@
 //! offsets. Everything is generated from fixed seeds, so every run produces the same bytes.
 //!
 //! `cargo run -p zscan-fixtures --bin gen-fixtures` writes them to `tests/fixtures/`.
+//!
+//! Streams are made with stock zlib (flate2's zlib backend), so the scanner's parameter
+//! matching should reproduce them exactly, except ones marked `zlib_made: false`.
 
 use std::io::Write;
 
@@ -35,6 +38,8 @@ pub struct Expected {
     pub compressed_size: usize,
     pub payload: Vec<u8>,
     pub name: Option<String>,
+    /// Made by stock zlib, so some zlib setting reproduces it byte for byte.
+    pub zlib_made: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +112,11 @@ pub fn deflate(payload: &[u8], level: u32) -> Vec<u8> {
     let mut e = DeflateEncoder::new(Vec::new(), Compression::new(level));
     e.write_all(payload).unwrap();
     e.finish().unwrap()
+}
+
+/// zlib stream made by miniz_oxide instead of zlib: valid, but no zlib setting reproduces it.
+pub fn zlib_miniz(payload: &[u8], level: u8) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec_zlib(payload, level)
 }
 
 pub fn zlib(payload: &[u8], level: u32) -> Vec<u8> {
@@ -205,9 +215,15 @@ impl Builder {
         self.data.extend(encoded);
     }
 
+    /// Like [`Builder::stream`], for a stream not made by zlib.
+    pub fn foreign_stream(&mut self, kind: Kind, encoded: Vec<u8>, payload: Vec<u8>) {
+        self.stream(kind, encoded, payload, None);
+        self.expected.last_mut().unwrap().zlib_made = false;
+    }
+
     /// Record an expected stream at an arbitrary offset (for streams nested in other bytes).
     pub fn expect(&mut self, offset: usize, kind: Kind, compressed_size: usize, payload: Vec<u8>, name: Option<&str>) {
-        self.expected.push(Expected { offset, kind, compressed_size, payload, name: name.map(String::from) });
+        self.expected.push(Expected { offset, kind, compressed_size, payload, name: name.map(String::from), zlib_made: true });
     }
 
     pub fn finish(mut self, name: &'static str, description: &'static str) -> Fixture {
@@ -237,7 +253,13 @@ pub fn zlib_basic() -> Fixture {
     let p = b.text(2000);
     b.stream(Kind::Zlib, zlib_with_window(&p, 6, 12), p, None);
     b.random(500);
-    b.finish("zlib_basic", "zlib streams at several levels, a stored stream, a 4 KiB-window header, back-to-back streams")
+    let p = b.text(4000);
+    b.foreign_stream(Kind::Zlib, zlib_miniz(&p, 6), p);
+    b.random(300);
+    b.finish(
+        "zlib_basic",
+        "zlib streams at several levels, a stored stream, a 4 KiB-window header, back-to-back streams, one made by miniz",
+    )
 }
 
 pub fn gzip_basic() -> Fixture {
